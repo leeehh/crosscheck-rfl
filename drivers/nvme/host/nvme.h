@@ -28,6 +28,9 @@ extern unsigned int nvme_io_timeout;
 extern unsigned int admin_timeout;
 #define NVME_ADMIN_TIMEOUT	(admin_timeout * HZ)
 
+unsigned long nvme_io_timeout_jiffies(void);
+unsigned long nvme_admin_timeout_jiffies(void);
+
 #define NVME_DEFAULT_KATO	5
 
 #ifdef CONFIG_ARCH_NO_SG_CHAIN
@@ -814,6 +817,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
 		const struct nvme_ctrl_ops *ops, unsigned long quirks);
 int nvme_add_ctrl(struct nvme_ctrl *ctrl);
 void nvme_uninit_ctrl(struct nvme_ctrl *ctrl);
+void nvme_trace_sq(struct request *req, u16 sq_head, u16 sq_tail);
 void nvme_start_ctrl(struct nvme_ctrl *ctrl);
 void nvme_stop_ctrl(struct nvme_ctrl *ctrl);
 int nvme_init_ctrl_finish(struct nvme_ctrl *ctrl, bool was_suspended);

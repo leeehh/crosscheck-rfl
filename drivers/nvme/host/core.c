@@ -58,6 +58,18 @@ module_param_named(io_timeout, nvme_io_timeout, uint, 0644);
 MODULE_PARM_DESC(io_timeout, "timeout in seconds for I/O");
 EXPORT_SYMBOL_GPL(nvme_io_timeout);
 
+unsigned long nvme_io_timeout_jiffies(void)
+{
+	return NVME_IO_TIMEOUT;
+}
+EXPORT_SYMBOL_GPL(nvme_io_timeout_jiffies);
+
+unsigned long nvme_admin_timeout_jiffies(void)
+{
+	return NVME_ADMIN_TIMEOUT;
+}
+EXPORT_SYMBOL_GPL(nvme_admin_timeout_jiffies);
+
 static unsigned char shutdown_timeout = 5;
 module_param(shutdown_timeout, byte, 0644);
 MODULE_PARM_DESC(shutdown_timeout, "timeout in seconds for controller shutdown");
@@ -125,6 +137,12 @@ EXPORT_SYMBOL_GPL(nvme_reset_wq);
 
 struct workqueue_struct *nvme_delete_wq;
 EXPORT_SYMBOL_GPL(nvme_delete_wq);
+
+void nvme_trace_sq(struct request *req, u16 sq_head, u16 sq_tail)
+{
+	trace_nvme_sq(req, cpu_to_le16(sq_head), sq_tail);
+}
+EXPORT_SYMBOL_GPL(nvme_trace_sq);
 
 static LIST_HEAD(nvme_subsystems);
 DEFINE_MUTEX(nvme_subsystems_lock);
