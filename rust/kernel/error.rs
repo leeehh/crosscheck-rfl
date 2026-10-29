@@ -51,6 +51,7 @@ pub mod code {
     declare_err!(EEXIST, "File exists.");
     declare_err!(EXDEV, "Cross-device link.");
     declare_err!(ENODEV, "No such device.");
+    declare_err!(ENODATA, "No data available.");
     declare_err!(ENOTDIR, "Not a directory.");
     declare_err!(EISDIR, "Is a directory.");
     declare_err!(EINVAL, "Invalid argument.");
@@ -67,6 +68,7 @@ pub mod code {
     declare_err!(EDOM, "Math argument out of domain of func.");
     declare_err!(ERANGE, "Math result not representable.");
     declare_err!(EOVERFLOW, "Value too large for defined data type.");
+    declare_err!(ENETDOWN, "Network is down.");
     declare_err!(ETIMEDOUT, "Connection timed out.");
     declare_err!(ERESTARTSYS, "Restart the system call.");
     declare_err!(ERESTARTNOINTR, "System call was interrupted by a signal and will be restarted.");
@@ -80,6 +82,8 @@ pub mod code {
     declare_err!(ENOTSYNC, "Update synchronization mismatch.");
     declare_err!(EBADCOOKIE, "Cookie is stale.");
     declare_err!(ENOTSUPP, "Operation is not supported.");
+    declare_err!(EOPNOTSUPP, "Operation not supported on transport endpoint.");
+    declare_err!(EPROTO, "Protocol error.");
     declare_err!(ETOOSMALL, "Buffer or request is too small.");
     declare_err!(ESERVERFAULT, "An untranslatable error occurred.");
     declare_err!(EBADTYPE, "Type not supported by server.");

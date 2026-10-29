@@ -23,6 +23,36 @@ use core::{
     ptr::{addr_of_mut, NonNull},
 };
 
+/// RouterBoard 532 platform helpers.
+///
+/// The upstream C driver is Kconfig-gated by `MIKROTIK_RB532`; these wrappers
+/// expose the same board-specific entry points to Rust translations.
+pub mod rb532 {
+    use crate::bindings;
+
+    /// RouterBoard 532 GPIO alternate-function controller.
+    pub struct Rb532Gpio;
+
+    impl Rb532Gpio {
+        /// Restore the alternate function for a RouterBoard 532 GPIO pin.
+        pub fn set_func(gpio: u32) {
+            // SAFETY: The caller must pass a GPIO pin supported by the RB532 GPIO block.
+            unsafe { bindings::rb532_gpio_set_func(gpio) };
+        }
+    }
+
+    /// RouterBoard 532 U5 latch controller.
+    pub struct LatchU5;
+
+    impl LatchU5 {
+        /// Update the U5 latch, setting `set` bits and clearing `clear` bits.
+        pub fn update(set: u32, clear: u32) {
+            // SAFETY: These masks are interpreted by the RB532 platform latch helper.
+            unsafe { bindings::set_latch_u5(set, clear) };
+        }
+    }
+}
+
 /// An adapter for the registration of platform drivers.
 pub struct Adapter<T: Driver>(T);
 
@@ -232,12 +262,14 @@ impl<Ctx: device::DeviceContext> Device<Ctx> {
         self.0.get()
     }
 
-    /// Returns the resource at `index`, if any.
-    pub fn resource_by_index(&self, index: u32) -> Option<&Resource> {
+    /// Returns the resource of the given `type_` at `index`, if any.
+    ///
+    /// `type_` is an `IORESOURCE_*` selector (e.g. [`bindings::IORESOURCE_MEM`]
+    /// or [`bindings::IORESOURCE_IO`]) matching the C `platform_get_resource()`
+    /// contract: the index is counted only over resources of that type.
+    fn resource_of_type(&self, type_: u32, index: u32) -> Option<&Resource> {
         // SAFETY: `self.as_raw()` returns a valid pointer to a `struct platform_device`.
-        let resource = unsafe {
-            bindings::platform_get_resource(self.as_raw(), bindings::IORESOURCE_MEM, index)
-        };
+        let resource = unsafe { bindings::platform_get_resource(self.as_raw(), type_, index) };
 
         if resource.is_null() {
             return None;
@@ -246,6 +278,25 @@ impl<Ctx: device::DeviceContext> Device<Ctx> {
         // SAFETY: `resource` is a valid pointer to a `struct resource` as
         // returned by `platform_get_resource`.
         Some(unsafe { Resource::from_raw(resource) })
+    }
+
+    /// Returns the MMIO resource ([`IORESOURCE_MEM`]) at `index`, if any.
+    ///
+    /// [`IORESOURCE_MEM`]: bindings::IORESOURCE_MEM
+    pub fn resource_by_index(&self, index: u32) -> Option<&Resource> {
+        self.resource_of_type(bindings::IORESOURCE_MEM, index)
+    }
+
+    /// Returns the port-I/O resource ([`IORESOURCE_IO`]) at `index`, if any.
+    ///
+    /// This mirrors `platform_get_resource(pdev, IORESOURCE_IO, index)` and is
+    /// the counterpart to [`resource_by_index`](Self::resource_by_index) for
+    /// legacy port-I/O devices (e.g. an ISA 16550 UART whose `platform_device`
+    /// carries a `DEFINE_RES_IO(base, len)` region rather than an MMIO window).
+    ///
+    /// [`IORESOURCE_IO`]: bindings::IORESOURCE_IO
+    pub fn io_resource_by_index(&self, index: u32) -> Option<&Resource> {
+        self.resource_of_type(bindings::IORESOURCE_IO, index)
     }
 
     /// Returns the resource with a given `name`, if any.

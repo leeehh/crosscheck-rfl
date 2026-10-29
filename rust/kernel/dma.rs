@@ -9,10 +9,12 @@ use crate::{
     device::{Bound, Core},
     error::{to_result, Result},
     prelude::*,
+    str::CStr,
     sync::aref::ARef,
+    sync::Arc,
     transmute::{AsBytes, FromBytes},
 };
-use core::ptr::NonNull;
+use core::{marker::PhantomData, mem::size_of, ptr::NonNull};
 
 /// DMA address type.
 ///
@@ -84,6 +86,53 @@ pub trait Device: AsRef<device::Device<Core>> {
             bindings::dma_set_mask_and_coherent(self.as_ref().as_raw(), mask.value())
         })
     }
+
+    /// Set up both DMA masks while the bus driver's `probe()` callback has exclusive ownership of
+    /// the device.
+    ///
+    /// Bus adapters implement this trait only for their `Core`-context device handle. During
+    /// `probe()` that handle has not yet been published to data-path callbacks, so no DMA
+    /// allocation or mapping can run concurrently. This method captures that adapter guarantee
+    /// and keeps the C-boundary `unsafe` operation out of individual drivers.
+    fn dma_set_mask_and_coherent_for_probe(&self, mask: DmaMask) -> Result {
+        // SAFETY: The bus adapter's Core/probe context guarantees exclusive setup: the candidate
+        // driver cannot publish a DMA allocation or mapping until probe returns successfully.
+        unsafe { self.dma_set_mask_and_coherent(mask) }
+    }
+
+    /// Set the minimum DMA alignment mask during exclusive probe setup.
+    fn dma_set_min_align_mask_for_probe(&self, mask: u32) {
+        // SAFETY: The bus adapter's Core/probe context prevents concurrent
+        // DMA mappings while the device parameters are being established.
+        unsafe { bindings::dma_set_min_align_mask(self.as_ref().as_raw(), mask) };
+    }
+
+    /// Set the maximum DMA segment size during exclusive probe setup.
+    fn dma_set_max_segment_size_for_probe(&self, size: u32) {
+        // SAFETY: See `dma_set_min_align_mask_for_probe`.
+        unsafe { bindings::dma_set_max_seg_size(self.as_ref().as_raw(), size) };
+    }
+}
+
+/// Largest single DMA mapping supported by `dev`.
+#[inline]
+pub fn max_mapping_size(dev: &device::Device) -> usize {
+    // SAFETY: This is a value-only query on a live device.
+    unsafe { bindings::dma_max_mapping_size(dev.as_raw()) }
+}
+
+/// Preferred upper bound for one DMA mapping on `dev`.
+#[inline]
+pub fn optimal_mapping_size(dev: &device::Device) -> usize {
+    // SAFETY: This is a value-only query on a live device.
+    unsafe { bindings::dma_opt_mapping_size(dev.as_raw()) }
+}
+
+/// Boundary mask across which DMA ranges cannot be merged.
+#[inline]
+pub fn merge_boundary(dev: &device::Device) -> usize {
+    // SAFETY: This is a value-only query on a live device.
+    unsafe { bindings::dma_get_merge_boundary(dev.as_raw()) as usize }
 }
 
 /// A DMA mask that holds a bitmask with the lowest `n` bits set.
@@ -189,6 +238,11 @@ impl DmaMask {
 pub struct Attrs(u32);
 
 impl Attrs {
+    /// No special DMA mapping attributes.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
     /// Get the raw representation of this attribute.
     pub(crate) fn as_raw(self) -> crate::ffi::c_ulong {
         self.0 as crate::ffi::c_ulong
@@ -325,6 +379,98 @@ impl From<DataDirection> for bindings::dma_data_direction {
         direction as u32 as Self
     }
 }
+
+/// An owned DMA allocation without a CPU-accessible mapping.
+///
+/// This wraps `dma_alloc_attrs()` with [`attrs::DMA_ATTR_NO_KERNEL_MAPPING`].
+/// The value returned in the C `cpu_addr` position may be an opaque cookie rather
+/// than a dereferenceable pointer, so this abstraction deliberately exposes only
+/// the DMA address and allocation size. The cookie is retained solely for the
+/// matching `dma_free_attrs()` call.
+///
+/// Platforms may ignore `DMA_ATTR_NO_KERNEL_MAPPING` and create a CPU mapping
+/// anyway. This type still does not expose it, which preserves the same safe API
+/// and ownership rules on every platform.
+pub struct NoKernelMappingAllocation {
+    dev: ARef<device::Device>,
+    dma_handle: DmaAddress,
+    size: usize,
+    cookie: NonNull<u8>,
+    dma_attrs: Attrs,
+}
+
+impl NoKernelMappingAllocation {
+    /// Allocates `size` bytes of coherent DMA memory without requesting a CPU
+    /// mapping.
+    ///
+    /// `dma_attrs` contains any additional allocation attributes; this method
+    /// always adds [`attrs::DMA_ATTR_NO_KERNEL_MAPPING`].
+    pub fn new(
+        dev: &device::Device<Bound>,
+        size: usize,
+        gfp_flags: kernel::alloc::Flags,
+        dma_attrs: Attrs,
+    ) -> Result<Self> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+
+        let dma_attrs = dma_attrs | attrs::DMA_ATTR_NO_KERNEL_MAPPING;
+        let mut dma_handle = 0;
+        // SAFETY: `dev` is valid by the `Device` type invariant. The returned
+        // value is treated only as an opaque release cookie and is never
+        // dereferenced.
+        let cookie = unsafe {
+            bindings::dma_alloc_attrs(
+                dev.as_raw(),
+                size,
+                &mut dma_handle,
+                gfp_flags.as_raw(),
+                dma_attrs.as_raw(),
+            )
+        };
+        let cookie = NonNull::new(cookie).ok_or(ENOMEM)?.cast();
+
+        Ok(Self {
+            dev: dev.into(),
+            dma_handle,
+            size,
+            cookie,
+            dma_attrs,
+        })
+    }
+
+    /// Returns the size of the allocation in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Returns the DMA address base of the allocation.
+    pub fn dma_handle(&self) -> DmaAddress {
+        self.dma_handle
+    }
+}
+
+/// The device must be halted before this object is dropped.
+impl Drop for NoKernelMappingAllocation {
+    fn drop(&mut self) {
+        // SAFETY: The device reference, size, opaque cookie, DMA address and
+        // attributes are exactly those retained from the successful allocation.
+        unsafe {
+            bindings::dma_free_attrs(
+                self.dev.as_raw(),
+                self.size,
+                self.cookie.as_ptr().cast(),
+                self.dma_handle,
+                self.dma_attrs.as_raw(),
+            )
+        }
+    }
+}
+
+// SAFETY: Ownership of the allocation and its release cookie moves with the
+// value; the type exposes no CPU-accessible memory.
+unsafe impl Send for NoKernelMappingAllocation {}
 
 /// An abstraction of the `dma_alloc_coherent` API.
 ///
@@ -651,6 +797,283 @@ impl<T: AsBytes + FromBytes> Drop for CoherentAllocation<T> {
 // SAFETY: It is safe to send a `CoherentAllocation` to another thread if `T`
 // can be sent to another thread.
 unsafe impl<T: AsBytes + FromBytes + Send> Send for CoherentAllocation<T> {}
+
+/// A fixed-size coherent allocation pool bound to a DMA device.
+///
+/// Every checked-out [`DmaPoolAllocation`] retains an [`Arc`] to its source
+/// pool. Consequently `dma_pool_destroy()` cannot run until all allocations
+/// have been returned, and an allocation cannot be freed through a different
+/// pool instance.
+pub struct DmaPool<T: FromBytes + Copy> {
+    raw: NonNull<bindings::dma_pool>,
+    _dev: ARef<device::Device>,
+    _p: PhantomData<T>,
+}
+
+// SAFETY: The DMA pool API serializes allocation/free operations. Values of T
+// are exclusively owned by their DmaPoolAllocation.
+unsafe impl<T: FromBytes + Copy + Send> Send for DmaPool<T> {}
+// SAFETY: Shared pool access only allocates distinct elements.
+unsafe impl<T: FromBytes + Copy + Send> Sync for DmaPool<T> {}
+
+impl<T: FromBytes + Copy> DmaPool<T> {
+    /// Create a pool for one `T` per allocation on `node`.
+    pub fn new(
+        name: &CStr,
+        dev: &device::Device<Bound>,
+        alignment: usize,
+        boundary: usize,
+        node: i32,
+        flags: crate::alloc::Flags,
+    ) -> Result<Arc<Self>> {
+        if size_of::<T>() == 0 || alignment == 0 || !alignment.is_power_of_two() {
+            return Err(EINVAL);
+        }
+        if boundary != 0 && !boundary.is_power_of_two() {
+            return Err(EINVAL);
+        }
+        // SAFETY: `dev` is bound for this construction call, `name` is NUL
+        // terminated, and size/alignment/boundary satisfy dma_pool's input
+        // contract. The returned pool is paired with Drop below.
+        let raw = unsafe {
+            bindings::dma_pool_create_node(
+                name.as_char_ptr(),
+                dev.as_raw(),
+                size_of::<T>(),
+                alignment,
+                boundary,
+                node,
+            )
+        };
+        let raw = NonNull::new(raw).ok_or(ENOMEM)?;
+        Arc::new(
+            Self {
+                raw,
+                _dev: dev.into(),
+                _p: PhantomData,
+            },
+            flags,
+        )
+        .map_err(|_| ENOMEM)
+    }
+
+    /// Allocate and zero one pool element.
+    pub fn allocate(self: &Arc<Self>, flags: crate::alloc::Flags) -> Result<DmaPoolAllocation<T>> {
+        let mut dma_address = 0;
+        // SAFETY: The Arc keeps the live pool stable; dma_pool_alloc returns
+        // exclusive storage for exactly one T and writes its DMA address.
+        let cpu_address = unsafe {
+            bindings::dma_pool_alloc(self.raw.as_ptr(), flags.as_raw(), &mut dma_address)
+        };
+        let cpu_address = NonNull::new(cpu_address.cast::<T>()).ok_or(ENOMEM)?;
+        // SAFETY: Pool storage is suitably aligned and sized for T. Zeroing
+        // establishes a valid value for a FromBytes type; Copy excludes Drop.
+        unsafe { cpu_address.as_ptr().write_bytes(0, 1) };
+        Ok(DmaPoolAllocation {
+            cpu_address,
+            dma_address,
+            pool: self.clone(),
+        })
+    }
+}
+
+impl<T: FromBytes + Copy> Drop for DmaPool<T> {
+    fn drop(&mut self) {
+        // SAFETY: Each allocation retains an Arc, so the final pool reference
+        // can disappear only after every allocation has been returned.
+        unsafe { bindings::dma_pool_destroy(self.raw.as_ptr()) };
+    }
+}
+
+/// One typed allocation checked out from a [`DmaPool`].
+pub struct DmaPoolAllocation<T: FromBytes + Copy> {
+    cpu_address: NonNull<T>,
+    dma_address: DmaAddress,
+    pool: Arc<DmaPool<T>>,
+}
+
+// SAFETY: The allocation is uniquely owned and its pool/device are retained.
+unsafe impl<T: FromBytes + Copy + Send> Send for DmaPoolAllocation<T> {}
+
+impl<T: FromBytes + Copy> DmaPoolAllocation<T> {
+    /// DMA address to place in a device descriptor.
+    #[inline]
+    pub fn dma_address(&self) -> DmaAddress {
+        self.dma_address
+    }
+
+    /// CPU pointer to the allocation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent concurrent device access for the duration of
+    /// any reference or operation derived from this pointer.
+    #[inline]
+    pub unsafe fn as_mut_ptr(&mut self) -> *mut T {
+        self.cpu_address.as_ptr()
+    }
+
+    /// Read-only CPU pointer to the allocation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent concurrent device writes to the allocation.
+    #[inline]
+    pub unsafe fn as_ptr(&self) -> *const T {
+        self.cpu_address.as_ptr()
+    }
+}
+
+impl<T: FromBytes + Copy> Drop for DmaPoolAllocation<T> {
+    fn drop(&mut self) {
+        // SAFETY: This allocation came from this exact retained pool and has
+        // not previously been returned.
+        unsafe {
+            bindings::dma_pool_free(
+                self.pool.raw.as_ptr(),
+                self.cpu_address.as_ptr().cast(),
+                self.dma_address,
+            )
+        };
+    }
+}
+
+/// One DMA segment in a noncontiguous allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NoncontiguousSegment {
+    address: DmaAddress,
+    length: usize,
+}
+
+impl NoncontiguousSegment {
+    /// Device-visible base address.
+    #[inline]
+    pub fn address(self) -> DmaAddress {
+        self.address
+    }
+
+    /// Segment length in bytes.
+    #[inline]
+    pub fn length(self) -> usize {
+        self.length
+    }
+}
+
+/// An owned `dma_alloc_noncontiguous()` allocation.
+pub struct NoncontiguousAllocation {
+    dev: ARef<device::Device>,
+    table: NonNull<bindings::sg_table>,
+    size: usize,
+    direction: DataDirection,
+}
+
+// SAFETY: The allocation and mapping are owned and may be transferred after
+// the device has been quiesced according to the DMA API contract.
+unsafe impl Send for NoncontiguousAllocation {}
+
+impl NoncontiguousAllocation {
+    /// Allocate a potentially physically fragmented DMA region.
+    pub fn new(
+        dev: &device::Device<Bound>,
+        size: usize,
+        direction: DataDirection,
+        flags: crate::alloc::Flags,
+        attrs: Attrs,
+    ) -> Result<Self> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: `dev` is bound, arguments describe a nonzero allocation,
+        // and Drop uses the exact same device, size, table, and direction.
+        let table = unsafe {
+            bindings::dma_alloc_noncontiguous(
+                dev.as_raw(),
+                size,
+                direction.into(),
+                flags.as_raw(),
+                attrs.as_raw(),
+            )
+        };
+        Ok(Self {
+            dev: dev.into(),
+            table: NonNull::new(table).ok_or(ENOMEM)?,
+            size,
+            direction,
+        })
+    }
+
+    /// Requested allocation size.
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Iterate over the DMA-mapped segments.
+    pub fn segments(&self) -> NoncontiguousSegments<'_> {
+        // SAFETY: The owned table remains initialized for self's lifetime.
+        let table = unsafe { self.table.as_ref() };
+        NoncontiguousSegments {
+            current: NonNull::new(table.sgl),
+            remaining: table.nents,
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// Base address when the DMA layer coalesced the allocation into a single
+    /// device-visible range.
+    pub fn single_dma_address(&self) -> Result<DmaAddress> {
+        let mut segments = self.segments();
+        let first = segments.next().ok_or(EIO)?;
+        if segments.next().is_some() || first.length < self.size {
+            return Err(E2BIG);
+        }
+        Ok(first.address)
+    }
+}
+
+impl Drop for NoncontiguousAllocation {
+    fn drop(&mut self) {
+        // SAFETY: Exact inverse of the successful allocation in `new`; callers
+        // must quiesce the device before dropping any DMA allocation.
+        unsafe {
+            bindings::dma_free_noncontiguous(
+                self.dev.as_raw(),
+                self.size,
+                self.table.as_ptr(),
+                self.direction.into(),
+            )
+        };
+    }
+}
+
+/// Iterator over DMA segments owned by a [`NoncontiguousAllocation`].
+pub struct NoncontiguousSegments<'a> {
+    current: Option<NonNull<bindings::scatterlist>>,
+    remaining: u32,
+    _lifetime: PhantomData<&'a NoncontiguousAllocation>,
+}
+
+impl Iterator for NoncontiguousSegments<'_> {
+    type Item = NoncontiguousSegment;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.current?;
+        if self.remaining == 0 {
+            self.current = None;
+            return None;
+        }
+        // SAFETY: `current` is one of the remaining live entries in the
+        // allocation's sg_table and the table is DMA mapped.
+        let segment = NoncontiguousSegment {
+            address: unsafe { bindings::sg_dma_address(current.as_ptr()) },
+            length: unsafe { bindings::sg_dma_len(current.as_ptr()) as usize },
+        };
+        self.remaining -= 1;
+        // SAFETY: sg_next returns the next table entry or NULL.
+        self.current = NonNull::new(unsafe { bindings::sg_next(current.as_ptr()) });
+        Some(segment)
+    }
+}
 
 /// Reads a field of an item from an allocated region of structs.
 ///

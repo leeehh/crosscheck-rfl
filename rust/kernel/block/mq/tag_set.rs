@@ -38,10 +38,23 @@ impl<T: Operations> TagSet<T> {
         num_tags: u32,
         num_maps: u32,
     ) -> impl PinInit<Self, error::Error> {
+        Self::new_with_pdu(nr_hw_queues, num_tags, num_maps, 0)
+    }
+
+    /// Create a tag set reserving `pdu_size` extra bytes per request for driver-private data (the
+    /// PDU). The PDU lives immediately after the [`RequestDataWrapper`] in the request's
+    /// `cmd_size` area; access it via [`Request::pdu`](super::Request::pdu). Mirrors C
+    /// `tag_set.cmd_size = sizeof(driver_pdu) + sizeof(refcount)`.
+    pub fn new_with_pdu(
+        nr_hw_queues: u32,
+        num_tags: u32,
+        num_maps: u32,
+        pdu_size: usize,
+    ) -> impl PinInit<Self, error::Error> {
         // SAFETY: `blk_mq_tag_set` only contains integers and pointers, which
         // all are allowed to be 0.
         let tag_set: bindings::blk_mq_tag_set = unsafe { core::mem::zeroed() };
-        let tag_set: Result<_> = core::mem::size_of::<RequestDataWrapper>()
+        let tag_set: Result<_> = (core::mem::size_of::<RequestDataWrapper>() + pdu_size)
             .try_into()
             .map(|cmd_size| {
                 bindings::blk_mq_tag_set {
@@ -76,6 +89,12 @@ impl<T: Operations> TagSet<T> {
         self.inner.get()
     }
 }
+
+// SAFETY: `TagSet` wraps a C `struct blk_mq_tag_set` (a kernel object the C core synchronizes
+// internally) and carries `PhantomData<T>` only to bind the `Operations` vtable — it owns no `T`.
+// It is safe to share/send across threads regardless of `T` (the C tag set is thread-safe).
+unsafe impl<T: Operations> Send for TagSet<T> {}
+unsafe impl<T: Operations> Sync for TagSet<T> {}
 
 #[pinned_drop]
 impl<T: Operations> PinnedDrop for TagSet<T> {

@@ -6,7 +6,17 @@
 //!
 //! C header: [`include/linux/completion.h`](srctree/include/linux/completion.h)
 
-use crate::{bindings, prelude::*, types::Opaque};
+use crate::{bindings, error::to_result, prelude::*, time::Jiffies, types::Opaque};
+
+/// Result of waiting for a completion with a timeout.
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionTimeoutResult {
+    /// The completion fired before expiry, with this many jiffies remaining.
+    Completed(Jiffies),
+    /// The timeout expired before a matching completion.
+    TimedOut,
+}
 
 /// Synchronization primitive to signal when a certain task has been completed.
 ///
@@ -99,6 +109,16 @@ impl Completion {
         unsafe { bindings::complete_all(self.as_raw()) };
     }
 
+    /// Signal a single task waiting on this completion.
+    ///
+    /// This method wakes up at most one task waiting on this completion; unlike
+    /// [`Completion::complete_all`], the completion is not permanently done and may be reused after
+    /// a call to [`Completion::reinit`].
+    pub fn complete(&self) {
+        // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
+        unsafe { bindings::complete(self.as_raw()) };
+    }
+
     /// Wait for completion of a task.
     ///
     /// This method waits for the completion of a task; it is not interruptible and there is no
@@ -108,5 +128,51 @@ impl Completion {
     pub fn wait_for_completion(&self) {
         // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
         unsafe { bindings::wait_for_completion(self.as_raw()) };
+    }
+
+    /// Wait for completion of a task, interruptible by fatal signals.
+    ///
+    /// Mirrors C's `wait_for_completion_killable()`. Blocks until the completion is signalled (by
+    /// [`Completion::complete`] or [`Completion::complete_all`]) or a fatal signal is received.
+    /// Returns `Ok(0)` on completion; `Err(ERESTARTSYS)` if interrupted.
+    pub fn wait_for_completion_killable(&self) -> Result {
+        // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
+        to_result(unsafe { bindings::wait_for_completion_killable(self.as_raw()) })
+    }
+
+    /// Wait with I/O accounting for at most `timeout` jiffies.
+    ///
+    /// This may sleep and must not be called from atomic context.
+    pub fn wait_for_completion_io_timeout(&self, timeout: Jiffies) -> CompletionTimeoutResult {
+        // SAFETY: `self` is a fully initialized completion whose pinned
+        // allocation remains live for the entire blocking call.
+        let remaining = unsafe { bindings::wait_for_completion_io_timeout(self.as_raw(), timeout) };
+        if remaining == 0 {
+            CompletionTimeoutResult::TimedOut
+        } else {
+            CompletionTimeoutResult::Completed(remaining)
+        }
+    }
+
+    /// Return a synchronized snapshot of whether a completion is pending.
+    pub fn is_done(&self) -> bool {
+        // SAFETY: `self.as_raw()` points to a valid initialized completion.
+        unsafe { bindings::completion_done(self.as_raw()) }
+    }
+
+    /// Reinitialize the completion so it can be reused.
+    ///
+    /// Mirrors C's `reinit_completion()`: resets the completion to the unsignalled state so a
+    /// subsequent [`Completion::wait_for_completion_killable`] blocks until the next
+    /// [`Completion::complete`]. Required when a completion is reused across requests (e.g. a
+    /// virtqueue request/response cycle), since [`Completion::complete`] only releases one waiter.
+    pub fn reinit(&self) {
+        // Mirrors C's `reinit_completion()`, which is `x->done = 0` (a plain write; the wait queue
+        // is untouched). Done as a direct field write so the driver `.ko` needs no extra helper
+        // symbol. SAFETY: `self.as_raw()` is a valid `struct completion`; `done` is a plain
+        // `unsigned int` and an aligned 4-byte write is atomic on this arch (matching C).
+        unsafe {
+            core::ptr::addr_of_mut!((*self.as_raw()).done).write(0);
+        }
     }
 }

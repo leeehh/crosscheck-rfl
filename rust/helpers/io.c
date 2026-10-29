@@ -99,6 +99,16 @@ void rust_helper_writel_relaxed(u32 value, void __iomem *addr)
 	writel_relaxed(value, addr);
 }
 
+u32 rust_helper_ioread32be(const void __iomem *addr)
+{
+	return ioread32be(addr);
+}
+
+void rust_helper_iowrite32be(u32 value, void __iomem *addr)
+{
+	iowrite32be(value, addr);
+}
+
 #ifdef CONFIG_64BIT
 void rust_helper_writeq_relaxed(u64 value, void __iomem *addr)
 {
@@ -140,3 +150,65 @@ void rust_helper_release_region(resource_size_t start, resource_size_t n)
 {
 	release_region(start, n);
 }
+
+#ifdef CONFIG_HAS_IOPORT
+u8 rust_helper_inb(u16 port)
+{
+	return inb(port);
+}
+
+u16 rust_helper_inw(u16 port)
+{
+	return inw(port);
+}
+
+u32 rust_helper_inl(u16 port)
+{
+	return inl(port);
+}
+
+void rust_helper_outb(u8 value, u16 port)
+{
+	outb(value, port);
+}
+
+void rust_helper_outw(u16 value, u16 port)
+{
+	outw(value, port);
+}
+
+void rust_helper_outl(u32 value, u16 port)
+{
+	outl(value, port);
+}
+
+u8 rust_helper_inb_p(u16 port)
+{
+	return inb_p(port);
+}
+
+u16 rust_helper_inw_p(u16 port)
+{
+	return inw_p(port);
+}
+
+u32 rust_helper_inl_p(u16 port)
+{
+	return inl_p(port);
+}
+
+void rust_helper_outb_p(u8 value, u16 port)
+{
+	outb_p(value, port);
+}
+
+void rust_helper_outw_p(u16 value, u16 port)
+{
+	outw_p(value, port);
+}
+
+void rust_helper_outl_p(u32 value, u16 port)
+{
+	outl_p(value, port);
+}
+#endif /* CONFIG_HAS_IOPORT */

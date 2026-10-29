@@ -201,3 +201,95 @@ impl_genmask_fn!(
     /// assert_eq!(genmask_u8(0..=7), u8::MAX);
     /// ```
 );
+
+/// Integer operations used by C bit/log2 helpers.
+pub trait BitNumber: Copy {
+    /// Number of bits in the integer type.
+    const BITS: u32;
+
+    /// Returns the number of trailing zero bits.
+    fn trailing_zeros(self) -> u32;
+
+    /// Returns whether `self` is a power of two.
+    fn is_power_of_two(self) -> bool;
+
+    /// Returns the next power of two greater than or equal to `self`.
+    fn next_power_of_two(self) -> Self;
+
+    /// Returns the previous power of two less than or equal to `self`.
+    fn previous_power_of_two(self) -> Self;
+}
+
+macro_rules! impl_bit_number {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl BitNumber for $ty {
+                const BITS: u32 = <$ty>::BITS;
+
+                #[inline]
+                fn trailing_zeros(self) -> u32 {
+                    <$ty>::trailing_zeros(self)
+                }
+
+                #[inline]
+                fn is_power_of_two(self) -> bool {
+                    <$ty>::is_power_of_two(self)
+                }
+
+                #[inline]
+                fn next_power_of_two(self) -> Self {
+                    <$ty>::next_power_of_two(self)
+                }
+
+                #[inline]
+                fn previous_power_of_two(self) -> Self {
+                    let bits = <$ty>::BITS - 1 - <$ty>::leading_zeros(self);
+                    (1 as $ty) << bits
+                }
+            }
+        )*
+    };
+}
+
+impl_bit_number!(u8, u16, u32, u64, usize);
+
+/// Return the index of the least-significant set bit.
+///
+/// This mirrors the C `__ffs()` helper. Callers must pass a non-zero value.
+#[inline]
+pub fn ffs<T: BitNumber>(value: T) -> u32 {
+    debug_assert!(value.trailing_zeros() < T::BITS);
+    value.trailing_zeros()
+}
+
+/// Return whether `value` is a power of two.
+#[inline]
+pub fn is_power_of_2<T: BitNumber>(value: T) -> bool {
+    value.is_power_of_two()
+}
+
+/// Round `value` up to the next power of two.
+///
+/// This mirrors `__roundup_pow_of_two()`. Callers must pass a non-zero value
+/// whose rounded value is representable by `T`.
+#[inline]
+pub fn roundup_pow_of_two<T: BitNumber>(value: T) -> T {
+    debug_assert!(value.trailing_zeros() < T::BITS);
+    value.next_power_of_two()
+}
+
+/// Round `value` down to the previous power of two.
+///
+/// This mirrors `__rounddown_pow_of_two()`. Callers must pass a non-zero value.
+#[inline]
+pub fn rounddown_pow_of_two<T: BitNumber>(value: T) -> T {
+    debug_assert!(value.trailing_zeros() < T::BITS);
+    value.previous_power_of_two()
+}
+
+/// Sign-extend a 32-bit value whose sign bit is at `index`.
+#[inline]
+pub const fn sign_extend32(value: u32, index: u32) -> i32 {
+    let shift = 31 - index;
+    ((value << shift) as i32) >> shift
+}

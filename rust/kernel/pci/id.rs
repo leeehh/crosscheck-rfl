@@ -154,6 +154,15 @@ macro_rules! define_all_pci_vendors {
 
 /// Once constructed, a `Vendor` contains a valid PCI Vendor ID.
 impl Vendor {
+    /// Creates a `Vendor` from a raw 16-bit PCI vendor ID.
+    ///
+    /// Useful for device-id tables whose vendor is not one of the named
+    /// [`Vendor`] constants.
+    #[inline]
+    pub const fn new(vendor_id: u16) -> Self {
+        Self(vendor_id)
+    }
+
     /// Create a Vendor from a raw 16-bit vendor ID.
     #[inline]
     pub(super) fn from_raw(vendor_id: u16) -> Self {

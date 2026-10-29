@@ -12,3 +12,11 @@ void rust_helper_init_work_with_key(struct work_struct *work, work_func_t func,
 	INIT_LIST_HEAD(&work->entry);
 	work->func = func;
 }
+
+struct workqueue_struct *
+rust_helper_alloc_freezable_cpu_intensive_workqueue(const char *name)
+{
+	return alloc_workqueue("%s",
+			       WQ_FREEZABLE | WQ_CPU_INTENSIVE | WQ_PERCPU,
+			       0, name);
+}

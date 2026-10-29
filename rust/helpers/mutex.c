@@ -23,6 +23,12 @@ void rust_helper_mutex_assert_is_held(struct mutex *mutex)
 	lockdep_assert_held(mutex);
 }
 
+void rust_helper_mutex_set_lockdep_subclass(struct mutex *mutex,
+					    unsigned int subclass)
+{
+	lockdep_set_subclass(mutex, subclass);
+}
+
 void rust_helper_mutex_destroy(struct mutex *lock)
 {
 	mutex_destroy(lock);

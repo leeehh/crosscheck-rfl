@@ -5,7 +5,7 @@
 //! [`ThreadedRegistration`], which allow users to register handlers for a given
 //! IRQ line.
 
-use core::marker::PhantomPinned;
+use core::marker::{PhantomData, PhantomPinned};
 
 use crate::alloc::Allocator;
 use crate::device::{Bound, Device};
@@ -119,6 +119,10 @@ impl<'a> IrqRequest<'a> {
     /// Returns the IRQ number of an [`IrqRequest`].
     pub fn irq(&self) -> u32 {
         self.irq
+    }
+
+    pub(crate) fn device(&self) -> &Device<Bound> {
+        self.dev
     }
 }
 
@@ -477,6 +481,156 @@ impl<T: ThreadedHandler + 'static> ThreadedRegistration<T> {
     }
 }
 
+/// A threaded IRQ registration whose callback data is an already-pinned driver state.
+///
+/// This models C `devm_request_threaded_irq(..., data)` users where the IRQ handler should
+/// operate on the same provider state that owns the registration, without embedding another
+/// copy of that state in the registration object.
+///
+/// # Drop ordering (self-referential use)
+///
+/// Unlike [`ThreadedRegistration`], which *owns* its callback data, this variant only *borrows*
+/// it through a raw `*const T`. When this registration is dropped, its inner [`Devres`] drops
+/// first and calls `free_irq`, which **blocks until all in-flight handlers have finished** — and
+/// those handlers dereference the borrowed `T`. The borrowed `T` must therefore stay fully valid
+/// until this registration's drop has *completed*, not merely until the registration is "alive".
+///
+/// In the natural self-referential pattern the registration is a sibling field of the same `T` it
+/// points at. Struct fields drop in declaration order, so this registration MUST be declared
+/// *before* any field whose data its handlers touch (ideally the first field): only then does its
+/// `free_irq` drain run while that data is still alive. Declaring it *after* such a field would
+/// leave a window where a draining handler dereferences already-dropped state — a use-after-free
+/// on unbind. (If the handler data is genuinely owned rather than borrowed, prefer
+/// [`ThreadedRegistration`], which is immune to this because it keeps the data alive through the
+/// drain.)
+#[pin_data]
+pub struct ThreadedRegistrationRef<T: ThreadedHandler + 'static> {
+    #[pin]
+    inner: Devres<RegistrationInner>,
+    data: *const T,
+    _p: PhantomData<T>,
+
+    /// Pinned because we pass a pointer to `Self` as the IRQ cookie.
+    #[pin]
+    _pin: PhantomPinned,
+}
+
+impl<T: ThreadedHandler + 'static> ThreadedRegistrationRef<T> {
+    /// Registers a threaded IRQ handler backed by a pinned driver state pointer.
+    ///
+    /// # Safety
+    ///
+    /// `data` must point to a valid, pinned `T` that stays fully valid until this registration's
+    /// [`Drop`] has completed (i.e. until the `free_irq` drain in drop returns), not merely while
+    /// the registration is alive — see the [type-level drop-ordering note]. The pointed-to value
+    /// must have initialized all fields used by the IRQ callbacks before this registration is
+    /// created.
+    ///
+    /// [type-level drop-ordering note]: ThreadedRegistrationRef#drop-ordering-self-referential-use
+    pub unsafe fn new<'a>(
+        request: IrqRequest<'a>,
+        flags: Flags,
+        name: &'static CStr,
+        data: *const T,
+    ) -> impl PinInit<Self, Error> + 'a {
+        try_pin_init!(&this in Self {
+            data: {
+                if data.is_null() {
+                    return Err(EINVAL);
+                }
+                data
+            },
+            inner <- Devres::new(
+                request.dev,
+                try_pin_init!(RegistrationInner {
+                    // INVARIANT: `this` is a valid pointer to the `ThreadedRegistrationRef`
+                    // instance. The driver-data pointer is stored inside `Self`.
+                    cookie: this.as_ptr().cast::<c_void>(),
+                    irq: {
+                        // SAFETY:
+                        // - The callbacks are valid for use with request_threaded_irq.
+                        // - `data` is valid by this function's safety contract.
+                        // - `Self` is pinned, so the IRQ cookie remains stable until drop.
+                        to_result(unsafe {
+                            bindings::request_threaded_irq(
+                                request.irq,
+                                Some(handle_threaded_irq_ref_callback::<T>),
+                                Some(thread_fn_ref_callback::<T>),
+                                flags.into_inner(),
+                                name.as_char_ptr(),
+                                this.as_ptr().cast::<c_void>(),
+                            )
+                        })?;
+                        request.irq
+                    }
+                })
+            ),
+            _p: PhantomData,
+            _pin: PhantomPinned,
+        })
+    }
+
+    /// Registers a threaded IRQ handler backed by a pinned driver-state reference.
+    ///
+    /// This is the safe counterpart to [`new`]. The caller passes `data: Pin<&T>` — typically the
+    /// driver's own pinned object obtained in the bus driver's *bound* phase — and the resulting
+    /// registration must be stored inside that same `T` (devres-owned) and declared *before* the
+    /// fields its handlers touch (see the [type-level drop-ordering note]), so the borrowed pointer
+    /// stays valid through the `free_irq` drain in drop. No caller-side `unsafe` is required.
+    ///
+    /// [`new`]: Self::new
+    /// [type-level drop-ordering note]: ThreadedRegistrationRef#drop-ordering-self-referential-use
+    pub fn register<'a>(
+        request: IrqRequest<'a>,
+        flags: Flags,
+        name: &'static CStr,
+        data: Pin<&'a T>,
+    ) -> impl PinInit<Self, Error> + 'a {
+        let data: *const T = data.get_ref();
+        // SAFETY: `data` is a pinned reference to a `T` the caller keeps alive — the registration
+        // is stored inside that same devres-owned `T`, declared before the fields its handlers
+        // touch — so the pointer stays valid until this registration's drop (the `free_irq` drain)
+        // completes. All fields used by the callbacks are initialized before `bound()` runs.
+        unsafe { Self::new(request, flags, name, data) }
+    }
+
+    /// Return the borrowed callback data.
+    pub fn data(&self) -> &T {
+        // SAFETY: Guaranteed by the constructor safety contract and registration lifetime.
+        unsafe { &*self.data }
+    }
+
+    /// Wait for pending IRQ handlers on other CPUs.
+    ///
+    /// # Context
+    ///
+    /// May sleep, and does so while holding the RCU read-side lock that guards the underlying
+    /// [`Devres`] access (the registration must stay alive across `synchronize_irq`, which itself
+    /// may block waiting for an in-flight *threaded* handler to finish). It must therefore not be
+    /// called from atomic context. When a bound [`Device`] reference is available, prefer
+    /// [`synchronize`](Self::synchronize), which does not hold the RCU read lock across the wait.
+    pub fn try_synchronize(&self) -> Result {
+        let inner = self.inner.try_access().ok_or(ENODEV)?;
+        inner.synchronize();
+        Ok(())
+    }
+
+    /// Wait for pending IRQ handlers on other CPUs.
+    ///
+    /// May sleep; must be called from a sleepable context.
+    pub fn synchronize(&self, dev: &Device<Bound>) -> Result {
+        let inner = self.inner.access(dev)?;
+        inner.synchronize();
+        Ok(())
+    }
+}
+
+// SAFETY: Registration state only stores kernel-owned devres state plus a pinned driver-data
+// pointer whose callbacks require `T: Sync`.
+unsafe impl<T: ThreadedHandler + 'static> Send for ThreadedRegistrationRef<T> {}
+// SAFETY: Callbacks access driver data through `T: Sync`.
+unsafe impl<T: ThreadedHandler + 'static> Sync for ThreadedRegistrationRef<T> {}
+
 /// # Safety
 ///
 /// This function should be only used as the callback in `request_threaded_irq`.
@@ -504,4 +658,38 @@ unsafe extern "C" fn thread_fn_callback<T: ThreadedHandler>(_irq: i32, ptr: *mut
     let device = unsafe { registration.inner.device().as_bound() };
 
     T::handle_threaded(&registration.handler, device) as c_uint
+}
+
+/// # Safety
+///
+/// This function should be only used as the callback in `request_threaded_irq`.
+unsafe extern "C" fn handle_threaded_irq_ref_callback<T: ThreadedHandler + 'static>(
+    _irq: i32,
+    ptr: *mut c_void,
+) -> c_uint {
+    // SAFETY: `ptr` is a pointer to `ThreadedRegistrationRef<T>` set in
+    // `ThreadedRegistrationRef::new`.
+    let registration = unsafe { &*(ptr as *const ThreadedRegistrationRef<T>) };
+    // SAFETY: The irq callback is removed before the device is unbound, so the fact that the irq
+    // callback is running implies that the device has not yet been unbound.
+    let device = unsafe { registration.inner.device().as_bound() };
+
+    T::handle(registration.data(), device) as c_uint
+}
+
+/// # Safety
+///
+/// This function should be only used as the callback in `request_threaded_irq`.
+unsafe extern "C" fn thread_fn_ref_callback<T: ThreadedHandler + 'static>(
+    _irq: i32,
+    ptr: *mut c_void,
+) -> c_uint {
+    // SAFETY: `ptr` is a pointer to `ThreadedRegistrationRef<T>` set in
+    // `ThreadedRegistrationRef::new`.
+    let registration = unsafe { &*(ptr as *const ThreadedRegistrationRef<T>) };
+    // SAFETY: The irq callback is removed before the device is unbound, so the fact that the irq
+    // callback is running implies that the device has not yet been unbound.
+    let device = unsafe { registration.inner.device().as_bound() };
+
+    T::handle_threaded(registration.data(), device) as c_uint
 }

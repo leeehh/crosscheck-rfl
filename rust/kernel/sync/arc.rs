@@ -304,6 +304,14 @@ impl<T: ?Sized> Arc<T> {
         unsafe { ArcBorrow::new(self.ptr) }
     }
 
+    /// Borrow the reference-counted value as pinned.
+    #[inline]
+    pub fn as_pin_ref(&self) -> Pin<&T> {
+        // SAFETY: The `Arc` invariant pins its value for the allocation's
+        // entire lifetime, and the returned borrow cannot outlive this Arc.
+        unsafe { Pin::new_unchecked(self.deref()) }
+    }
+
     /// Compare whether two [`Arc`] pointers reference the same underlying object.
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         core::ptr::eq(this.ptr.as_ptr(), other.ptr.as_ptr())

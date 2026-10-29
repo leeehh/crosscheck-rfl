@@ -99,5 +99,58 @@ mod request;
 mod tag_set;
 
 pub use operations::Operations;
-pub use request::Request;
+pub use request::{Request, RequestCompletion, RequestDmaMapping, RequestHandle};
 pub use tag_set::TagSet;
+
+use crate::{bindings, str::{CStr, CStrExt}};
+
+/// Status value passed when ending a blk-mq request.
+pub type BlockStatus = bindings::blk_status_t;
+
+/// Request completed successfully.
+pub const BLK_STS_OK: BlockStatus = bindings::BLK_STS_OK as BlockStatus;
+
+/// Request failed due to an I/O error. Bindgen does not currently export this enum member.
+pub const BLK_STS_IOERR: BlockStatus = 10 as BlockStatus;
+
+/// Number of hardware queues supported by the possible CPU topology.
+///
+/// A zero `max_queues` requests the topology-wide maximum.
+#[inline]
+pub fn num_possible_queues(max_queues: u32) -> u32 {
+    // SAFETY: This is a value-only block-layer topology query.
+    unsafe { bindings::blk_mq_num_possible_queues(max_queues) }
+}
+
+/// Initialize a single-entry scatterlist in place (mirrors C `sg_init_one(sg, buf, len)`). The
+/// abstraction owns the FFI; the caller guarantees `buf` is a valid buffer of `len` bytes that
+/// outlives the scatterlist's use. `#[inline(always)]` so the call inlines into the driver module
+/// (the `.ko` references `sg_init_one` directly, exactly as C does — no extra/renamed symbol for
+/// north's set-refinement to mis-resolve).
+#[inline(always)]
+pub fn sg_init_one(sg: &mut bindings::scatterlist, buf: *mut core::ffi::c_void, len: u32) {
+    // SAFETY: `sg` is a valid `&mut scatterlist`; the caller guarantees `buf`/`len` are valid.
+    unsafe { bindings::sg_init_one(sg, buf, len) };
+}
+
+/// Allocate a dynamic block major number (mirrors C `register_blkdev(0, name)`). Returns the
+/// allocated major (> 0) or an error. `#[inline(always)]` so the `.ko` references `__register_blkdev`
+/// directly (as C does).
+#[inline(always)]
+pub fn register_blkdev_dynamic(name: &CStr) -> crate::error::Result<i32> {
+    // SAFETY: `name` is a valid NUL-terminated string; `__register_blkdev(0, name, NULL)` allocates
+    // a dynamic major and is safe to call from module init.
+    let m = unsafe { bindings::__register_blkdev(0, name.as_char_ptr(), None) };
+    if m <= 0 {
+        return Err(crate::error::Error::from_errno(m));
+    }
+    Ok(m)
+}
+
+/// Release a block major number (mirrors C `unregister_blkdev(major, name)`). `#[inline(always)]`
+/// so the `.ko` references `unregister_blkdev` directly (as C does).
+#[inline(always)]
+pub fn unregister_blkdev(major: u32, name: &CStr) {
+    // SAFETY: `major` was allocated by `register_blkdev_dynamic` with `name`; safe to release.
+    unsafe { bindings::unregister_blkdev(major, name.as_char_ptr()) };
+}

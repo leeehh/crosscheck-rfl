@@ -93,6 +93,21 @@ impl Resource {
         unsafe { &*ptr.cast() }
     }
 
+    /// Returns the root resource of the I/O port (PIO) address space.
+    ///
+    /// This is the kernel-global `ioport_resource`, the parent of every
+    /// port-mapped I/O region. Request a sub-range from it via
+    /// [`Self::request_region`] with [`Flags::IORESOURCE_IO`] (see also
+    /// [`PortRegion`](crate::io::PortRegion)).
+    pub fn ioport() -> &'static Self {
+        // SAFETY: `ioport_resource` is a valid `struct resource` that lives for
+        // the entire lifetime of the kernel. We only ever expose shared
+        // references to it; the C helpers that mutate the resource tree
+        // (`__request_region` / `release_region`) take the appropriate locks
+        // internally.
+        unsafe { Self::from_raw(&raw mut bindings::ioport_resource) }
+    }
+
     /// Requests a resource region.
     ///
     /// Exclusive access will be given and the region will be marked as busy.
@@ -189,6 +204,15 @@ impl Flags {
     /// Check whether `flags` is contained in `self`.
     pub fn contains(self, flags: Flags) -> bool {
         (self & flags) == flags
+    }
+
+    /// Build a [`Flags`] from a raw `struct resource::flags` value.
+    ///
+    /// Useful for accessors that read the flags of a resource the kernel already
+    /// owns (for example a PCI BAR via `pci::Device::resource_flags`).
+    #[inline]
+    pub fn from_raw(value: c_ulong) -> Self {
+        Flags(value)
     }
 }
 

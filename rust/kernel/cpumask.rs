@@ -124,6 +124,13 @@ impl Cpumask {
         unsafe { bindings::cpumask_setall(self.as_raw()) };
     }
 
+    /// Clear every CPU from the mask.
+    #[inline]
+    pub fn clear_all(&mut self) {
+        // A zero bit-array is the canonical empty `struct cpumask` representation.
+        self.0 = Opaque::zeroed();
+    }
+
     /// Checks if cpumask is empty.
     ///
     /// Equivalent to the kernel's `cpumask_empty` API.

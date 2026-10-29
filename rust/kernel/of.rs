@@ -6,10 +6,54 @@ use crate::{
     bindings,
     device_id::{RawDeviceId, RawDeviceIdIndex},
     prelude::*,
+    types::Opaque,
 };
 
 /// IdTable type for OF drivers.
 pub type IdTable<T> = &'static dyn kernel::device_id::IdTable<DeviceId, T>;
+
+/// A borrowed Open Firmware device node.
+///
+/// This is a non-owning wrapper for a `struct device_node` whose lifetime is
+/// tied to the object that returned it, for example a [`Device`](crate::device::Device).
+#[repr(transparent)]
+pub struct DeviceNode(Opaque<bindings::device_node>);
+
+impl DeviceNode {
+    /// Obtain the raw `struct device_node *`.
+    pub(crate) fn as_raw(&self) -> *mut bindings::device_node {
+        self.0.get()
+    }
+
+    /// Convert a raw C `struct device_node` pointer to a borrowed [`DeviceNode`].
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure that `ptr` is valid for the returned lifetime.
+    pub(crate) unsafe fn from_raw<'a>(ptr: *mut bindings::device_node) -> &'a Self {
+        // SAFETY: Guaranteed by the safety requirements of this function.
+        unsafe { &*ptr.cast() }
+    }
+
+    /// Return the node name.
+    pub fn name(&self) -> &CStr {
+        // SAFETY: `self.as_raw()` is valid by the type invariant.
+        let name = unsafe { (*self.as_raw()).name };
+        if name.is_null() {
+            crate::c_str!("")
+        } else {
+            // SAFETY: OF node names are stored as NUL-terminated C strings.
+            unsafe { CStr::from_char_ptr(name) }
+        }
+    }
+}
+
+#[cfg(CONFIG_COMMON_CLK)]
+pub mod clk {
+    //! Open Firmware clock-provider helpers.
+
+    pub use crate::clk::HwProvider;
+}
 
 /// An open firmware device id.
 #[repr(transparent)]

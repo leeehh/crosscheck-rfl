@@ -4,7 +4,12 @@
 //!
 //! C header: [`include/linux/seq_file.h`](srctree/include/linux/seq_file.h)
 
-use crate::{bindings, c_str, fmt, str::CStrExt as _, types::NotThreadSafe, types::Opaque};
+use crate::{
+    bindings, c_str, fmt,
+    str::{CStr, CStrExt as _},
+    types::NotThreadSafe,
+    types::Opaque,
+};
 
 /// A utility for generating the contents of a seq file.
 #[repr(transparent)]
@@ -40,6 +45,13 @@ impl SeqFile {
                 core::ptr::from_ref(&args).cast::<crate::ffi::c_void>(),
             );
         }
+    }
+
+    /// Write a static C string to the sequence file.
+    pub fn puts(&self, s: &CStr) {
+        // SAFETY: `self.inner` is a valid `struct seq_file` for this callback and `s` is
+        // NUL-terminated.
+        unsafe { bindings::__seq_puts(self.inner.get(), s.as_char_ptr()) };
     }
 }
 

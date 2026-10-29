@@ -8,6 +8,7 @@
 
 use crate::alloc::{AllocError, Flags};
 use crate::bindings;
+use crate::ffi;
 #[cfg(not(CONFIG_RUST_BITMAP_HARDENED))]
 use crate::pr_err;
 use core::ptr::NonNull;
@@ -86,6 +87,10 @@ impl Bitmap {
     #[expect(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.data.len()
+    }
+
+    fn capped_nbits(&self, nbits: usize) -> u32 {
+        u32::try_from(core::cmp::min(nbits, self.len())).unwrap()
     }
 }
 
@@ -390,6 +395,211 @@ impl Bitmap {
         // SAFETY: `index` is within bounds and the caller has ensured that
         // there is no mix of non-atomic and atomic operations.
         unsafe { bindings::clear_bit(index, self.as_ptr().cast_mut()) };
+    }
+
+    /// Assign `index` bit.
+    #[inline]
+    pub fn assign_bit(&mut self, index: usize, value: bool) {
+        if value {
+            self.set_bit(index);
+        } else {
+            self.clear_bit(index);
+        }
+    }
+
+    /// Return whether `index` bit is set.
+    #[inline]
+    pub fn get_bit(&self, index: usize) -> bool {
+        bitmap_assert!(
+            index < self.len(),
+            "Bit `index` must be < {}, was {}",
+            self.len(),
+            index
+        );
+        self.next_bit(index) == Some(index)
+    }
+
+    /// Set all bits to zero.
+    #[inline]
+    pub fn zero(&mut self) {
+        let nwords = usize::div_ceil(self.len(), usize::BITS as usize);
+        // SAFETY: `self.as_mut_ptr()` points to storage for at least `nwords` words by invariant.
+        unsafe { core::ptr::write_bytes(self.as_mut_ptr(), 0, nwords) };
+    }
+
+    /// Copy up to `nbits` bits from `src`, clearing bits outside that range.
+    #[inline]
+    pub fn copy_from(&mut self, src: &Bitmap, nbits: usize) {
+        let nbits = core::cmp::min(nbits, core::cmp::min(self.len(), src.len()));
+        self.zero();
+        let mut bit = src.next_bit(0);
+        while let Some(index) = bit {
+            if index >= nbits {
+                break;
+            }
+            self.set_bit(index);
+            if index + 1 >= nbits {
+                break;
+            }
+            bit = src.next_bit(index + 1);
+        }
+    }
+
+    /// Return whether the first `nbits` bits are all zero.
+    #[inline]
+    pub fn is_empty_prefix(&self, nbits: usize) -> bool {
+        let nbits = core::cmp::min(nbits, self.len());
+        if nbits == 0 {
+            return true;
+        }
+        match self.next_bit(0) {
+            Some(index) => index >= nbits,
+            None => true,
+        }
+    }
+
+    /// Extract an 8-bit little-endian lane starting at bit `offset`.
+    #[inline]
+    pub fn get_value8(&self, offset: usize) -> u8 {
+        let mut value = 0u8;
+        for bit in 0..8 {
+            let index = offset + bit;
+            if index >= self.len() {
+                break;
+            }
+            if self.next_bit(index) == Some(index) {
+                value |= 1 << bit;
+            }
+        }
+        value
+    }
+
+    /// Store an 8-bit little-endian lane starting at bit `offset`.
+    #[inline]
+    pub fn set_value8(&mut self, value: u8, offset: usize) {
+        for bit in 0..8 {
+            let index = offset + bit;
+            if index >= self.len() {
+                break;
+            }
+            self.assign_bit(index, value & (1 << bit) != 0);
+        }
+    }
+
+    /// Compute `self = bitmap1 & bitmap2` for the first `nbits` bits.
+    #[inline]
+    pub fn bit_and(&mut self, bitmap1: &Bitmap, bitmap2: &Bitmap, nbits: usize) -> bool {
+        let nbits = self
+            .capped_nbits(core::cmp::min(nbits, core::cmp::min(bitmap1.len(), bitmap2.len())));
+        // SAFETY: All operands are valid for `nbits` bits by invariant and clamping above.
+        unsafe {
+            bindings::__bitmap_and(
+                self.as_mut_ptr().cast::<ffi::c_ulong>(),
+                bitmap1.as_ptr().cast::<ffi::c_ulong>(),
+                bitmap2.as_ptr().cast::<ffi::c_ulong>(),
+                nbits,
+            )
+        }
+    }
+
+    /// Compute `self = bitmap1 | bitmap2` for the first `nbits` bits.
+    #[inline]
+    pub fn bit_or(&mut self, bitmap1: &Bitmap, bitmap2: &Bitmap, nbits: usize) {
+        let nbits = self
+            .capped_nbits(core::cmp::min(nbits, core::cmp::min(bitmap1.len(), bitmap2.len())));
+        // SAFETY: All operands are valid for `nbits` bits by invariant and clamping above.
+        unsafe {
+            bindings::__bitmap_or(
+                self.as_mut_ptr().cast::<ffi::c_ulong>(),
+                bitmap1.as_ptr().cast::<ffi::c_ulong>(),
+                bitmap2.as_ptr().cast::<ffi::c_ulong>(),
+                nbits,
+            )
+        };
+    }
+
+    /// Compute `self |= bitmap` for the first `nbits` bits.
+    #[inline]
+    pub fn bit_or_assign(&mut self, bitmap: &Bitmap, nbits: usize) {
+        let nbits = self.capped_nbits(core::cmp::min(nbits, bitmap.len()));
+        // SAFETY: `self` and `bitmap` are valid for `nbits` bits; C supports `dst == src1`.
+        unsafe {
+            bindings::__bitmap_or(
+                self.as_mut_ptr().cast::<ffi::c_ulong>(),
+                self.as_ptr().cast::<ffi::c_ulong>(),
+                bitmap.as_ptr().cast::<ffi::c_ulong>(),
+                nbits,
+            )
+        };
+    }
+
+    /// Compute `self = bitmap1 ^ bitmap2` for the first `nbits` bits.
+    #[inline]
+    pub fn bit_xor(&mut self, bitmap1: &Bitmap, bitmap2: &Bitmap, nbits: usize) {
+        let nbits = self
+            .capped_nbits(core::cmp::min(nbits, core::cmp::min(bitmap1.len(), bitmap2.len())));
+        // SAFETY: All operands are valid for `nbits` bits by invariant and clamping above.
+        unsafe {
+            bindings::__bitmap_xor(
+                self.as_mut_ptr().cast::<ffi::c_ulong>(),
+                bitmap1.as_ptr().cast::<ffi::c_ulong>(),
+                bitmap2.as_ptr().cast::<ffi::c_ulong>(),
+                nbits,
+            )
+        };
+    }
+
+    /// Compute `self = !bitmap` for the first `nbits` bits.
+    #[inline]
+    pub fn bit_complement(&mut self, bitmap: &Bitmap, nbits: usize) {
+        let nbits = self.capped_nbits(core::cmp::min(nbits, bitmap.len()));
+        // SAFETY: Both operands are valid for `nbits` bits by invariant and clamping above.
+        unsafe {
+            bindings::__bitmap_complement(
+                self.as_mut_ptr().cast::<ffi::c_ulong>(),
+                bitmap.as_ptr().cast::<ffi::c_ulong>(),
+                nbits,
+            )
+        };
+    }
+
+    /// Compute `self = (old & !mask) | (new & mask)` for the first `nbits` bits.
+    #[inline]
+    pub fn replace(&mut self, old: &Bitmap, new: &Bitmap, mask: &Bitmap, nbits: usize) {
+        let nbits = self.capped_nbits(core::cmp::min(
+            nbits,
+            core::cmp::min(old.len(), core::cmp::min(new.len(), mask.len())),
+        ));
+        // SAFETY: All operands are valid for `nbits` bits by invariant and clamping above.
+        unsafe {
+            bindings::__bitmap_replace(
+                self.as_mut_ptr().cast::<ffi::c_ulong>(),
+                old.as_ptr().cast::<ffi::c_ulong>(),
+                new.as_ptr().cast::<ffi::c_ulong>(),
+                mask.as_ptr().cast::<ffi::c_ulong>(),
+                nbits,
+            )
+        };
+    }
+
+    /// Compute `self = (self & !mask) | (new & mask)` for the first `nbits` bits.
+    #[inline]
+    pub fn replace_with(&mut self, new: &Bitmap, mask: &Bitmap, nbits: usize) {
+        let nbits = self.capped_nbits(core::cmp::min(
+            nbits,
+            core::cmp::min(new.len(), mask.len()),
+        ));
+        // SAFETY: All operands are valid for `nbits` bits by invariant and clamping above.
+        // The C helper explicitly supports `dst == old`.
+        unsafe {
+            bindings::__bitmap_replace(
+                self.as_mut_ptr().cast::<ffi::c_ulong>(),
+                self.as_ptr().cast::<ffi::c_ulong>(),
+                new.as_ptr().cast::<ffi::c_ulong>(),
+                mask.as_ptr().cast::<ffi::c_ulong>(),
+                nbits,
+            )
+        };
     }
 
     /// Copy `src` into this [`Bitmap`] and set any remaining bits to zero.

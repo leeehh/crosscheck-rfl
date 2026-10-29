@@ -45,6 +45,18 @@ pub struct SetOnce<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
+// SAFETY: `SetOnce<T>` synchronizes all access to `value` through the atomic `init` flag with
+// acquire/release ordering (see the type invariants): the single writer (`populate`) releases its
+// exclusive access by storing `2`, and readers (`as_ref`) only touch `value` after observing `2`
+// via an acquire load, so there is no data race. Sharing `&SetOnce<T>` across threads therefore
+// hands out `&T` to multiple threads (requires `T: Sync`) and may transfer the populated `T` from
+// the writer thread to reader threads (requires `T: Send`).
+unsafe impl<T: Send + Sync> Sync for SetOnce<T> {}
+
+// SAFETY: A `SetOnce<T>` owns its (possibly populated) `T`, so moving it to another thread is sound
+// when `T` is `Send`.
+unsafe impl<T: Send> Send for SetOnce<T> {}
+
 impl<T> Default for SetOnce<T> {
     fn default() -> Self {
         Self::new()

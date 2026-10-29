@@ -38,3 +38,8 @@ void rust_helper_udelay(unsigned long usec)
 {
 	udelay(usec);
 }
+
+void rust_helper_mdelay(unsigned long msec)
+{
+	mdelay(msec);
+}

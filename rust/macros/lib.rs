@@ -34,6 +34,7 @@ use proc_macro::TokenStream;
 /// ```ignore
 /// parameter_name: type {
 ///     default: default_value,
+///     permissions: 0o444,
 ///     description: "Description",
 /// }
 /// ```
@@ -52,6 +53,16 @@ use proc_macro::TokenStream;
 /// - [`u64`]
 /// - [`isize`]
 /// - [`usize`]
+/// - [`bool`]
+///
+/// `permissions` is optional and defaults to `0` (load-time only, absent from
+/// sysfs). Readable `i32`, `u32`, and `bool` parameters support read-only modes
+/// such as `0o444`. `bool` and `u32` also support writable modes such as
+/// `0o644`, backed by atomic storage for lock-free driver reads. Writable
+/// `u32` parameters may specify either an inclusive `"minimum..=maximum"`
+/// validator or `"possible_queues"`, which follows the blk-mq possible-queue
+/// topology. The validator field is optional and appears between permissions
+/// and description.
 ///
 /// C header: [`include/linux/moduleparam.h`](srctree/include/linux/moduleparam.h)
 ///
@@ -72,6 +83,7 @@ use proc_macro::TokenStream;
 ///     params: {
 ///         my_parameter: i64 {
 ///             default: 1,
+///             permissions: 0,
 ///             description: "This parameter has a default of 1",
 ///         },
 ///     },
@@ -89,6 +101,10 @@ use proc_macro::TokenStream;
 /// }
 /// # fn main() {}
 /// ```
+///
+/// Parameter descriptions are optional. A parameter may also set
+/// `modinfo_type` to override the type spelling reported by `modinfo`, or to
+/// an empty string to omit `parmtype` for a custom parameter callback.
 ///
 /// ## Firmware
 ///
@@ -127,6 +143,7 @@ use proc_macro::TokenStream;
 ///   - `authors`: array of ASCII string literals of the authors of the kernel module.
 ///   - `description`: string literal of the description of the kernel module.
 ///   - `license`: ASCII string literal of the license of the kernel module (required).
+///   - `version`: ASCII string literal of the version of the kernel module.
 ///   - `alias`: array of ASCII string literals of the alias names of the kernel module.
 ///   - `firmware`: array of ASCII string literals of the firmware files of
 ///     the kernel module.

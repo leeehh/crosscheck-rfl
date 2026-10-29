@@ -84,3 +84,18 @@ pub fn udelay(delta: Delta) {
         bindings::udelay(delta.as_micros_ceil() as c_ulong)
     }
 }
+
+/// Inserts a delay based on milliseconds with busy waiting.
+///
+/// Equivalent to the C side [`mdelay()`]. This is intended for atomic contexts
+/// that cannot sleep.
+///
+/// [`mdelay()`]: https://docs.kernel.org/timers/delay_sleep_functions.html#c.mdelay
+pub fn mdelay(delta: Delta) {
+    let micros = delta.as_micros_ceil().max(0);
+    let millis = micros.saturating_add(999) / 1000;
+
+    // SAFETY: It is always safe to call `mdelay()` with any duration. Very large
+    // values are a logic bug in the caller, but do not create Rust-side UB.
+    unsafe { bindings::mdelay(millis as c_ulong) }
+}

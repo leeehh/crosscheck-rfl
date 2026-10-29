@@ -442,3 +442,105 @@ pub type NotThreadSafe = PhantomData<*mut ()>;
 /// [`NotThreadSafe`]: type@NotThreadSafe
 #[allow(non_upper_case_globals)]
 pub const NotThreadSafe: NotThreadSafe = PhantomData;
+
+/// Reinterpret a valid, aligned raw pointer as a shared reference. The abstraction owns the
+/// `unsafe` dereference; the caller MUST guarantee `ptr` is valid, aligned, initialized, and points
+/// to a `T` that lives for the chosen lifetime `'a` (e.g. a blk-mq tag-exclusive slot, or a
+/// driver-struct pointer valid for the device's lifetime — the same borrowed-pointer contract as
+/// `input::Device::set_drvdata_pinned`). Generic ⇒ monomorphized into the caller (no exported
+/// symbol); not a virtio protocol step, so invisible to north's MIR protocol checks.
+pub fn borrow_ref<'a, T>(ptr: *const T) -> &'a T {
+    // SAFETY: by contract, `ptr` is a valid, aligned, initialized `*const T` valid for `'a`.
+    unsafe { &*ptr }
+}
+
+/// Reinterpret a valid, aligned raw pointer as an exclusive reference. The abstraction owns the
+/// `unsafe` dereference; the caller MUST guarantee `ptr` is valid, aligned, initialized, and
+/// EXCLUSIVE for `'a` (e.g. blk-mq's one-in-flight-request-per-tag guarantee). Generic ⇒
+/// monomorphized into the caller.
+pub fn borrow_mut<'a, T>(ptr: *mut T) -> &'a mut T {
+    // SAFETY: by contract, `ptr` is valid, aligned, initialized, and exclusive for `'a`.
+    unsafe { &mut *ptr }
+}
+
+/// Construct an all-zero `T`. The abstraction owns the `unsafe` `core::mem::zeroed`; the caller
+/// MUST guarantee `T` is a POD type whose all-zero bit-pattern is a valid representation (plain
+/// integers, raw pointers, and C POD structs like `scatterlist`). Generic ⇒ monomorphized into the
+/// caller.
+pub fn zeroed<T>() -> T {
+    // SAFETY: by contract, `T` is POD and zero-valid.
+    unsafe { core::mem::zeroed() }
+}
+
+/// An owned, `Send` handle to a borrowed pinned `T` — a `*const T` the abstraction dereferences
+/// safely. Created from a `&T` the caller guarantees stays alive + pinned (not moved) for the
+/// handle's use, and whose outstanding users (e.g. a spawned work item) are canceled/joined before
+/// `T` is dropped. The abstraction owns the `unsafe` dereference + the `Send`/`Sync` impls; the
+/// driver writes no `unsafe`. Generic ⇒ monomorphized into the caller (no exported symbol); not a
+/// virtio protocol step, so invisible to north's MIR protocol checks.
+///
+/// Use case: a virtio driver whose `config_changed` runs in hardirq context must defer sleeping
+/// work (e.g. virtio-balloon inflate/deflate) to a workqueue; `try_spawn`'s closure is `'static +
+/// Send` and captures a `PinnedRef` to the driver struct (recovered from `vdev->priv`, alive until
+/// `unbind`).
+pub struct PinnedRef<T> {
+    ptr: *const T,
+}
+
+// SAFETY: A moved `PinnedRef<T>` only yields shared references, so crossing to
+// another thread is sound exactly when shared access to `T` is sound there.
+unsafe impl<T: Sync> Send for PinnedRef<T> {}
+// SAFETY: `&PinnedRef<T>` only yields a shared `&T`; safe from multiple threads iff `T: Sync`.
+unsafe impl<T: Sync> Sync for PinnedRef<T> {}
+
+impl<T> PinnedRef<T> {
+    /// Create a handle to `t`. The caller MUST guarantee `t` stays alive + pinned for the handle's
+    /// use, and that outstanding work referencing it is canceled/joined before `t` is dropped.
+    pub fn new(t: &T) -> Self {
+        Self { ptr: t as *const T }
+    }
+
+    /// Borrow the referenced `T`. Safe by the creation contract (the caller guarantees `T` is
+    /// alive for the handle's use).
+    pub fn as_ref(&self) -> &T {
+        // SAFETY: by contract, `ptr` is a valid, aligned, initialized `*const T` for the handle's use.
+        unsafe { &*self.ptr }
+    }
+}
+
+/// A field initialized late — after the owning struct is pinned — such as a blk-mq `gendisk` built
+/// in a bus driver's `start` (after `vdev->priv` is set, so device callbacks can safely recover the
+/// driver data). Encapsulates the `UnsafeCell` so the driver stays 0-unsafe. `install` must be
+/// called at most once, before any concurrent access; `take` at most once, after the device is
+/// quiesced (e.g. in `PinnedDrop`). Generic ⇒ monomorphized into the caller.
+pub struct LateInit<T>(UnsafeCell<Option<T>>);
+
+impl<T> LateInit<T> {
+    /// Create an empty (uninitialized) `LateInit`.
+    pub const fn new() -> Self {
+        Self(UnsafeCell::new(None))
+    }
+
+    /// Install `val`. The caller guarantees install-once and no concurrent access (the bus driver's
+    /// start-vs-callback discipline: `start` runs once before the device goes live).
+    pub fn install(&self, val: T) {
+        // SAFETY: `&self` is a valid `LateInit`; the caller guarantees install-once + no concurrent
+        // access.
+        unsafe {
+            *self.0.get() = Some(val);
+        }
+    }
+
+    /// Take the value out (for `PinnedDrop`). The caller guarantees no concurrent access (the drop
+    /// path, after the device is quiesced). Returns `None` if never installed.
+    pub fn take(&self) -> Option<T> {
+        // SAFETY: the caller guarantees no concurrent access.
+        unsafe { (*self.0.get()).take() }
+    }
+}
+
+impl<T> Default for LateInit<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}

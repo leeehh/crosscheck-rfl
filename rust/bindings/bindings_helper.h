@@ -29,6 +29,7 @@
 #include <linux/hrtimer_types.h>
 
 #include <linux/acpi.h>
+#include <crypto/skcipher.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -37,10 +38,13 @@
 #include <kunit/test.h>
 #include <linux/auxiliary_bus.h>
 #include <linux/bitmap.h>
+#include <linux/blk-integrity.h>
 #include <linux/blk-mq.h>
+#include <linux/blk-mq-dma.h>
 #include <linux/blk_types.h>
 #include <linux/blkdev.h>
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/completion.h>
 #include <linux/configfs.h>
 #include <linux/cpu.h>
@@ -49,6 +53,7 @@
 #include <linux/cred.h>
 #include <linux/debugfs.h>
 #include <linux/device/faux.h>
+#include <linux/dim.h>
 #include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
 #include <linux/errname.h>
@@ -58,13 +63,26 @@
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/fs.h>
+#include <linux/gpio/consumer.h>
+#include <linux/hwmon.h>
 #include <linux/i2c.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/iio.h>
+#include <linux/iio/sysfs.h>
+#include <linux/iio/trigger.h>
+#include <linux/iio/trigger_consumer.h>
+#include <linux/iio/triggered_buffer.h>
+#include <linux/input.h>
 #include <linux/ioport.h>
 #include <linux/jiffies.h>
 #include <linux/jump_label.h>
+#include <linux/libnvdimm.h>
+#include <linux/netdevice.h>
+#include <linux/skbuff.h>
 #include <linux/mdio.h>
 #include <linux/mm.h>
 #include <linux/miscdevice.h>
+#include <linux/mfd/syscon.h>
 #include <linux/of_device.h>
 #include <linux/pci.h>
 #include <linux/phy.h>
@@ -76,16 +94,43 @@
 #include <linux/pwm.h>
 #include <linux/random.h>
 #include <linux/refcount.h>
+#include <linux/reboot.h>
+#include <linux/reset.h>
+#include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/regulator/driver.h>
+#include <linux/regulator/of_regulator.h>
+#include <linux/rtc.h>
+#include <linux/rtnetlink.h>
 #include <linux/sched.h>
 #include <linux/security.h>
+#include <linux/serial_core.h>
 #include <linux/slab.h>
 #include <linux/task_work.h>
 #include <linux/tracepoint.h>
+#include <linux/tty_flip.h>
 #include <linux/usb.h>
+#include <linux/virtio.h>
+#include <linux/virtio_config.h>
+#include <linux/virtio_ring.h>
+#include <linux/hw_random.h>
+#include <uapi/linux/virtio_ids.h>
+#include <uapi/linux/virtio_config.h>
+#include <uapi/linux/virtio_crypto.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
+#include <net/net_failover.h>
+#include <net/netdev_rx_queue.h>
+#include <net/netdev_queues.h>
+#include <net/xdp.h>
+#include <scsi/scsi_cmnd.h>
+#include <scsi/scsi_device.h>
+#include <scsi/scsi_host.h>
+#include <scsi/scsi_status.h>
+#include <sound/core.h>
+#include <sound/pcm.h>
+#include <sound/pcm-indirect.h>
 #include <trace/events/rust_sample.h>
 
 /*
@@ -93,6 +138,10 @@
  * structures.
  */
 #include <../../drivers/base/base.h>
+#if IS_ENABLED(CONFIG_NVME_CORE)
+#include <../../drivers/nvme/host/nvme.h>
+#endif
+#include <../../drivers/tty/hvc/hvc_console.h>
 
 #if defined(CONFIG_DRM_PANIC_SCREEN_QR_CODE)
 // Used by `#[export]` in `drivers/gpu/drm/drm_panic_qr.rs`.

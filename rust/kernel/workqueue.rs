@@ -194,7 +194,7 @@ use crate::{
     time::Jiffies,
     types::Opaque,
 };
-use core::marker::PhantomData;
+use core::{marker::PhantomData, ops::Deref, ptr::NonNull};
 
 /// Creates a [`Work`] initialiser with the given name and a newly-created lock class.
 #[macro_export]
@@ -245,6 +245,44 @@ pub struct Queue(Opaque<bindings::workqueue_struct>);
 unsafe impl Send for Queue {}
 // SAFETY: Accesses to workqueues used by [`Queue`] are thread-safe.
 unsafe impl Sync for Queue {}
+
+/// An owned dynamically allocated workqueue.
+///
+/// Work items must be canceled or flushed before this value is dropped.
+pub struct OwnedQueue(NonNull<bindings::workqueue_struct>);
+
+// SAFETY: Workqueue core operations are thread-safe.
+unsafe impl Send for OwnedQueue {}
+// SAFETY: Workqueue core operations are thread-safe.
+unsafe impl Sync for OwnedQueue {}
+
+impl OwnedQueue {
+    /// Allocate a freezable, CPU-intensive per-CPU workqueue.
+    pub fn new_freezable_cpu_intensive_percpu(name: &'static CStr) -> Result<Self> {
+        // SAFETY: `name` is a permanent NUL-terminated string. The helper
+        // returns a new workqueue or NULL.
+        let raw = unsafe {
+            bindings::alloc_freezable_cpu_intensive_workqueue(name.as_char_ptr())
+        };
+        Ok(Self(NonNull::new(raw).ok_or(ENOMEM)?))
+    }
+}
+
+impl Deref for OwnedQueue {
+    type Target = Queue;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `self` owns a live workqueue until Drop.
+        unsafe { Queue::from_raw(self.0.as_ptr()) }
+    }
+}
+
+impl Drop for OwnedQueue {
+    fn drop(&mut self) {
+        // SAFETY: The owner guarantees no work item remains queued.
+        unsafe { bindings::destroy_workqueue(self.0.as_ptr()) };
+    }
+}
 
 impl Queue {
     /// Use the provided `struct workqueue_struct` with Rust.
@@ -576,6 +614,72 @@ pub unsafe trait HasWork<T, const ID: u64 = 0> {
     ///
     /// The pointer must point at a [`Work<T, ID>`] field in a struct of type `Self`.
     unsafe fn work_container_of(ptr: *mut Work<T, ID>) -> *mut Self;
+}
+
+/// Wait until an embedded [`Arc`]-owned work item is idle.
+///
+/// The caller must prevent new enqueue attempts before relying on this as a
+/// teardown barrier. This may sleep and must not be called by the work item
+/// itself. A queued item runs normally and consumes its workqueue-owned
+/// [`Arc`] reference before this function returns.
+pub fn flush<T, const ID: u64>(item: &Arc<T>) -> bool
+where
+    T: WorkItem<ID, Pointer = Arc<T>> + HasWork<T, ID>,
+{
+    let item_ptr = Arc::as_ptr(item).cast_mut();
+    // SAFETY: `item` pins a live allocation and the `HasWork` implementation
+    // returns its matching initialized `Work<T, ID>` field.
+    let work = unsafe { T::raw_get_work(item_ptr) };
+    // SAFETY: The field is live and pinned by `item` for this call.
+    let raw = unsafe { Work::raw_get(work) };
+    // SAFETY: The caller obeys the sleep/context and self-deadlock contract;
+    // the Arc keeps the embedded work structure alive until the wait ends.
+    unsafe { bindings::flush_work(raw) }
+}
+
+/// Cancel a pending embedded [`Arc`]-owned work item and wait until it is idle.
+///
+/// The caller must prevent new enqueue attempts before calling this function.
+/// If the item was pending, this also releases the workqueue-owned `Arc`
+/// reference that would otherwise have been consumed by its callback.
+pub fn cancel<T, const ID: u64>(item: &Arc<T>) -> bool
+where
+    T: WorkItem<ID, Pointer = Arc<T>> + HasWork<T, ID>,
+{
+    let item_ptr = Arc::as_ptr(item).cast_mut();
+    // SAFETY: `item` pins a live allocation and `HasWork` selects its matching field.
+    let work = unsafe { T::raw_get_work(item_ptr) };
+    // SAFETY: The field is live and pinned by `item`.
+    let raw = unsafe { Work::raw_get(work) };
+    // SAFETY: The caller prevents requeue races and may sleep.
+    let cancelled = unsafe { bindings::cancel_work_sync(raw) };
+    if cancelled {
+        // SAFETY: A successfully canceled pending work item owns exactly one
+        // leaked Arc reference installed by `RawWorkItem::__enqueue`.
+        drop(unsafe { Arc::from_raw(item_ptr) });
+    }
+    cancelled
+}
+
+/// Force a pending embedded delayed work item to run and wait until it is idle.
+///
+/// The caller must prevent new enqueue attempts before relying on this as a
+/// teardown barrier. The same sleep and self-deadlock restrictions as
+/// [`flush`] apply.
+pub fn flush_delayed<T, const ID: u64>(item: &Arc<T>) -> bool
+where
+    T: WorkItem<ID, Pointer = Arc<T>> + HasDelayedWork<T, ID>,
+{
+    let item_ptr = Arc::as_ptr(item).cast_mut();
+    // SAFETY: The matching HasDelayedWork implementation returns the work
+    // member embedded in a live delayed_work owned by `item`.
+    let work = unsafe { T::raw_get_work(item_ptr) };
+    // SAFETY: The field remains pinned by the Arc during this call.
+    let raw = unsafe { Work::raw_get(work) };
+    // SAFETY: `raw` points to the `work` field of the matching delayed-work object.
+    let delayed = unsafe { container_of!(raw, bindings::delayed_work, work) };
+    // SAFETY: `delayed` is live; the caller prevents requeue races and may sleep.
+    unsafe { bindings::flush_delayed_work(delayed) }
 }
 
 /// Used to safely implement the [`HasWork<T, ID>`] trait.

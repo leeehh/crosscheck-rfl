@@ -189,6 +189,14 @@ impl<T: ?Sized, B: Backend> Lock<T, B> {
     }
 }
 
+impl<T: ?Sized> Lock<T, mutex::MutexBackend> {
+    /// Set the lockdep subclass for this mutex.
+    pub fn set_lockdep_subclass(&self, subclass: u32) {
+        // SAFETY: `self.state` is an initialized `struct mutex`.
+        unsafe { bindings::mutex_set_lockdep_subclass(self.state.get(), subclass) };
+    }
+}
+
 /// A lock guard.
 ///
 /// Allows mutual exclusion primitives that implement the [`Backend`] trait to automatically unlock
@@ -235,7 +243,11 @@ impl<'a, T: ?Sized, B: Backend> Guard<'a, T, B> {
         self.lock
     }
 
-    pub(crate) fn do_unlocked<U>(&mut self, cb: impl FnOnce() -> U) -> U {
+    /// Temporarily releases the lock, runs `cb`, then re-acquires it. Use to call code that must not
+    /// be run with the lock held (e.g. a virtio vq callback dropping `vi->lock` around
+    /// `input_event`, which may take the input core's `event_lock`). The re-acquire uses the same
+    /// locking method as the original acquire (e.g. `spin_lock_irqsave` for [`SpinLockIrqSave`]).
+    pub fn do_unlocked<U>(&mut self, cb: impl FnOnce() -> U) -> U {
         // SAFETY: The caller owns the lock, so it is safe to unlock it.
         unsafe { B::unlock(self.lock.state.get(), &self.state) };
 

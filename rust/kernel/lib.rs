@@ -70,6 +70,8 @@ pub mod alloc;
 pub mod auxiliary;
 pub mod bitmap;
 pub mod bits;
+#[cfg(CONFIG_MEMORY_BALLOON)]
+pub mod balloon;
 #[cfg(CONFIG_BLOCK)]
 pub mod block;
 pub mod bug;
@@ -82,12 +84,14 @@ pub mod cpu;
 #[cfg(CONFIG_CPU_FREQ)]
 pub mod cpufreq;
 pub mod cpumask;
+pub mod crc8;
 pub mod cred;
 pub mod debugfs;
 pub mod device;
 pub mod device_id;
 pub mod devres;
 pub mod dma;
+pub mod dmi;
 pub mod driver;
 #[cfg(CONFIG_DRM = "y")]
 pub mod drm;
@@ -97,8 +101,25 @@ pub mod faux;
 pub mod firmware;
 pub mod fmt;
 pub mod fs;
+pub mod gpio;
+#[cfg(CONFIG_HW_RANDOM)]
+pub mod hwrng;
+#[cfg(CONFIG_HWMON)]
+pub mod hwmon;
 #[cfg(CONFIG_I2C = "y")]
 pub mod i2c;
+pub mod iio;
+#[cfg(CONFIG_INPUT)]
+pub mod input;
+#[cfg(CONFIG_LIBNVDIMM)]
+pub mod nvdimm;
+pub mod hvc;
+#[cfg(CONFIG_SCSI)]
+pub mod scsi;
+#[cfg(CONFIG_CRYPTO_SKCIPHER)]
+pub mod crypto;
+#[cfg(CONFIG_SND)]
+pub mod sound;
 pub mod id_pool;
 pub mod init;
 pub mod io;
@@ -110,11 +131,14 @@ pub mod jump_label;
 pub mod kunit;
 pub mod list;
 pub mod maple_tree;
+pub mod mempool;
 pub mod miscdevice;
 pub mod mm;
 pub mod module_param;
 #[cfg(CONFIG_NET)]
 pub mod net;
+#[cfg(CONFIG_NVME_CORE)]
+pub mod nvme;
 pub mod num;
 pub mod of;
 #[cfg(CONFIG_PM_OPP)]
@@ -123,6 +147,7 @@ pub mod page;
 #[cfg(CONFIG_PCI)]
 pub mod pci;
 pub mod pid_namespace;
+pub mod pinctrl;
 pub mod platform;
 pub mod prelude;
 pub mod print;
@@ -131,17 +156,25 @@ pub mod ptr;
 #[cfg(CONFIG_RUST_PWM_ABSTRACTIONS)]
 pub mod pwm;
 pub mod rbtree;
+pub mod reboot;
+#[cfg(CONFIG_REGMAP)]
+pub mod regmap;
 pub mod regulator;
+pub mod reset;
 pub mod revocable;
+#[cfg(CONFIG_RTC_CLASS)]
+pub mod rtc;
 pub mod scatterlist;
 pub mod security;
 pub mod seq_file;
+pub mod serial;
 pub mod sizes;
 pub mod slice;
 mod static_assert;
 #[doc(hidden)]
 pub mod std_vendor;
 pub mod str;
+pub mod suspend;
 pub mod sync;
 pub mod task;
 pub mod time;
@@ -149,8 +182,11 @@ pub mod tracepoint;
 pub mod transmute;
 pub mod types;
 pub mod uaccess;
+pub mod util;
 #[cfg(CONFIG_USB = "y")]
 pub mod usb;
+#[cfg(CONFIG_VIRTIO)]
+pub mod virtio;
 pub mod workqueue;
 pub mod xarray;
 

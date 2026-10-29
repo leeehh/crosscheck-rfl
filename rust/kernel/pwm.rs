@@ -58,6 +58,75 @@ impl From<Waveform> for bindings::pwm_waveform {
     }
 }
 
+/// PWM output polarity.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Polarity {
+    /// Active-high output.
+    #[default]
+    Normal,
+    /// Active-low output.
+    Inversed,
+}
+
+impl Polarity {
+    fn from_raw(raw: bindings::pwm_polarity) -> Result<Self> {
+        match raw {
+            bindings::pwm_polarity_PWM_POLARITY_NORMAL => Ok(Self::Normal),
+            bindings::pwm_polarity_PWM_POLARITY_INVERSED => Ok(Self::Inversed),
+            _ => Err(EINVAL),
+        }
+    }
+
+    fn as_raw(self) -> bindings::pwm_polarity {
+        match self {
+            Self::Normal => bindings::pwm_polarity_PWM_POLARITY_NORMAL,
+            Self::Inversed => bindings::pwm_polarity_PWM_POLARITY_INVERSED,
+        }
+    }
+}
+
+/// Legacy PWM channel state.
+///
+/// This mirrors `struct pwm_state` and is used by providers that implement
+/// the legacy `.apply`/`.get_state` callbacks rather than waveform callbacks.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct State {
+    /// PWM period in nanoseconds.
+    pub period: u64,
+    /// PWM duty cycle in nanoseconds.
+    pub duty_cycle: u64,
+    /// PWM output polarity.
+    pub polarity: Polarity,
+    /// Whether the PWM output is enabled.
+    pub enabled: bool,
+    /// Whether the provider may optimize the waveform while preserving power.
+    pub usage_power: bool,
+}
+
+impl State {
+    fn from_raw(state: &bindings::pwm_state) -> Result<Self> {
+        Ok(Self {
+            period: state.period,
+            duty_cycle: state.duty_cycle,
+            polarity: Polarity::from_raw(state.polarity)?,
+            enabled: state.enabled,
+            usage_power: state.usage_power,
+        })
+    }
+}
+
+impl From<State> for bindings::pwm_state {
+    fn from(state: State) -> Self {
+        bindings::pwm_state {
+            period: state.period,
+            duty_cycle: state.duty_cycle,
+            polarity: state.polarity.as_raw(),
+            enabled: state.enabled,
+            usage_power: state.usage_power,
+        }
+    }
+}
+
 /// Describes the outcome of a `round_waveform` operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundingOutcome {
@@ -94,6 +163,36 @@ impl Device {
     pub fn hwpwm(&self) -> u32 {
         // SAFETY: `self.as_raw()` provides a valid pointer for `self`'s lifetime.
         unsafe { (*self.as_raw()).hwpwm }
+    }
+
+    /// Gets the board-provided period argument for this PWM.
+    pub fn args_period(&self) -> u64 {
+        // SAFETY: `self.as_raw()` provides a valid pointer for `self`'s lifetime.
+        unsafe { (*self.as_raw()).args.period }
+    }
+
+    /// Sets the board-provided period argument for this PWM.
+    pub fn set_args_period(&self, period: u64) {
+        // SAFETY: `self.as_raw()` provides a valid pointer for `self`'s lifetime.
+        unsafe { (*self.as_raw()).args.period = period };
+    }
+
+    /// Gets the board-provided polarity argument for this PWM.
+    pub fn args_polarity(&self) -> Result<Polarity> {
+        // SAFETY: `self.as_raw()` provides a valid pointer for `self`'s lifetime.
+        Polarity::from_raw(unsafe { (*self.as_raw()).args.polarity })
+    }
+
+    /// Sets the board-provided polarity argument for this PWM.
+    pub fn set_args_polarity(&self, polarity: Polarity) {
+        // SAFETY: `self.as_raw()` provides a valid pointer for `self`'s lifetime.
+        unsafe { (*self.as_raw()).args.polarity = polarity.as_raw() };
+    }
+
+    /// Returns the cached PWM state.
+    pub fn state(&self) -> Result<State> {
+        // SAFETY: `self.as_raw()` provides a valid pointer for `self`'s lifetime.
+        State::from_raw(unsafe { &(*self.as_raw()).state })
     }
 
     /// Gets a reference to the parent `Chip` that this device belongs to.
@@ -179,10 +278,19 @@ pub trait PwmOps: 'static + Sized {
     /// This type must be [`Copy`], [`Default`], and fit within `PWM_WFHWSIZE`.
     type WfHw: Copy + Default;
 
+    /// Use the legacy `.apply`/`.get_state` PWM callbacks instead of the waveform callbacks.
+    const USE_LEGACY_STATE: bool = false;
+
+    /// Provide a legacy `.get_state` callback.
+    const HAS_GET_STATE: bool = false;
+
     /// Optional hook for when a PWM device is requested.
     fn request(_chip: &Chip<Self>, _pwm: &Device, _parent_dev: &device::Device<Bound>) -> Result {
         Ok(())
     }
+
+    /// Optional hook for when a PWM device is freed.
+    fn free(_chip: &Chip<Self>, _pwm: &Device, _parent_dev: &device::Device<Bound>) {}
 
     /// Optional hook for capturing a PWM signal.
     fn capture(
@@ -230,6 +338,26 @@ pub trait PwmOps: 'static + Sized {
         _chip: &Chip<Self>,
         _pwm: &Device,
         _wfhw: &Self::WfHw,
+        _parent_dev: &device::Device<Bound>,
+    ) -> Result {
+        Err(ENOTSUPP)
+    }
+
+    /// Apply a legacy PWM state.
+    fn apply(
+        _chip: &Chip<Self>,
+        _pwm: &Device,
+        _state: &State,
+        _parent_dev: &device::Device<Bound>,
+    ) -> Result {
+        Err(ENOTSUPP)
+    }
+
+    /// Read the current legacy PWM state from hardware.
+    fn get_state(
+        _chip: &Chip<Self>,
+        _pwm: &Device,
+        _state: &mut State,
         _parent_dev: &device::Device<Bound>,
     ) -> Result {
         Err(ENOTSUPP)
@@ -327,6 +455,21 @@ impl<T: PwmOps> Adapter<T> {
             Ok(()) => 0,
             Err(e) => e.to_errno(),
         }
+    }
+
+    /// # Safety
+    ///
+    /// Pointers from C must be valid.
+    unsafe extern "C" fn free_callback(
+        chip_ptr: *mut bindings::pwm_chip,
+        pwm_ptr: *mut bindings::pwm_device,
+    ) {
+        // SAFETY: PWM core guarantees `chip_ptr` and `pwm_ptr` are valid pointers.
+        let (chip, pwm) = unsafe { (Chip::<T>::from_raw(chip_ptr), Device::from_raw(pwm_ptr)) };
+
+        // SAFETY: The PWM core guarantees the parent device exists and is bound during callbacks.
+        let bound_parent = unsafe { chip.bound_parent_device() };
+        T::free(chip, pwm, bound_parent);
     }
 
     /// # Safety
@@ -466,6 +609,60 @@ impl<T: PwmOps> Adapter<T> {
             Err(e) => e.to_errno(),
         }
     }
+
+    /// # Safety
+    ///
+    /// Pointers from C must be valid.
+    unsafe extern "C" fn apply_callback(
+        chip_ptr: *mut bindings::pwm_chip,
+        pwm_ptr: *mut bindings::pwm_device,
+        state_ptr: *const bindings::pwm_state,
+    ) -> c_int {
+        // SAFETY: Relies on the function's contract that pointers are valid.
+        let (chip, pwm, state) = unsafe {
+            (
+                Chip::<T>::from_raw(chip_ptr),
+                Device::from_raw(pwm_ptr),
+                &*state_ptr,
+            )
+        };
+
+        let state = match State::from_raw(state) {
+            Ok(state) => state,
+            Err(e) => return e.to_errno(),
+        };
+
+        // SAFETY: The PWM core guarantees the parent device exists and is bound during callbacks.
+        let bound_parent = unsafe { chip.bound_parent_device() };
+        match T::apply(chip, pwm, &state, bound_parent) {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Pointers from C must be valid.
+    unsafe extern "C" fn get_state_callback(
+        chip_ptr: *mut bindings::pwm_chip,
+        pwm_ptr: *mut bindings::pwm_device,
+        state_ptr: *mut bindings::pwm_state,
+    ) -> c_int {
+        // SAFETY: Relies on the function's contract that pointers are valid.
+        let (chip, pwm) = unsafe { (Chip::<T>::from_raw(chip_ptr), Device::from_raw(pwm_ptr)) };
+        let mut state = State::default();
+
+        // SAFETY: The PWM core guarantees the parent device exists and is bound during callbacks.
+        let bound_parent = unsafe { chip.bound_parent_device() };
+        match T::get_state(chip, pwm, &mut state, bound_parent) {
+            Ok(()) => {
+                // SAFETY: `state_ptr` is guaranteed valid by the C caller.
+                unsafe { *state_ptr = state.into() };
+                0
+            }
+            Err(e) => e.to_errno(),
+        }
+    }
 }
 
 /// VTable structure wrapper for PWM operations.
@@ -501,13 +698,21 @@ pub const fn create_pwm_ops<T: PwmOps>() -> PwmOpsVTable {
     let mut ops: bindings::pwm_ops = unsafe { core::mem::zeroed() };
 
     ops.request = Some(Adapter::<T>::request_callback);
+    ops.free = Some(Adapter::<T>::free_callback);
     ops.capture = Some(Adapter::<T>::capture_callback);
 
-    ops.round_waveform_tohw = Some(Adapter::<T>::round_waveform_tohw_callback);
-    ops.round_waveform_fromhw = Some(Adapter::<T>::round_waveform_fromhw_callback);
-    ops.read_waveform = Some(Adapter::<T>::read_waveform_callback);
-    ops.write_waveform = Some(Adapter::<T>::write_waveform_callback);
-    ops.sizeof_wfhw = core::mem::size_of::<T::WfHw>();
+    if T::USE_LEGACY_STATE {
+        ops.apply = Some(Adapter::<T>::apply_callback);
+        if T::HAS_GET_STATE {
+            ops.get_state = Some(Adapter::<T>::get_state_callback);
+        }
+    } else {
+        ops.round_waveform_tohw = Some(Adapter::<T>::round_waveform_tohw_callback);
+        ops.round_waveform_fromhw = Some(Adapter::<T>::round_waveform_fromhw_callback);
+        ops.read_waveform = Some(Adapter::<T>::read_waveform_callback);
+        ops.write_waveform = Some(Adapter::<T>::write_waveform_callback);
+        ops.sizeof_wfhw = core::mem::size_of::<T::WfHw>();
+    }
 
     PwmOpsVTable(ops)
 }

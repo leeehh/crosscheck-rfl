@@ -25,6 +25,13 @@ pub struct GenDiskBuilder {
     logical_block_size: u32,
     physical_block_size: u32,
     capacity_sectors: u64,
+    max_segments: u32,
+    max_segment_size: u32,
+    max_hw_sectors: u32,
+    virt_boundary_mask: u64,
+    major: u32,
+    first_minor: u32,
+    minors: u32,
 }
 
 impl Default for GenDiskBuilder {
@@ -34,6 +41,13 @@ impl Default for GenDiskBuilder {
             logical_block_size: bindings::PAGE_SIZE as u32,
             physical_block_size: bindings::PAGE_SIZE as u32,
             capacity_sectors: 0,
+            max_segments: 0,
+            max_segment_size: 0,
+            max_hw_sectors: 0,
+            virt_boundary_mask: !0u64, // sentinel: don't set (no boundary)
+            major: 0,
+            first_minor: 0,
+            minors: 1, // single minor (no partitions) unless overridden
         }
     }
 }
@@ -94,6 +108,51 @@ impl GenDiskBuilder {
         self
     }
 
+    /// Set the maximum number of segments (scatterlist entries) per request. Mirrors C
+    /// `queue_limits.max_segments` (from `VIRTIO_BLK_F_SEG_MAX`). 0 ⇒ leave the default.
+    pub fn max_segments(mut self, max_segments: u32) -> Self {
+        self.max_segments = max_segments;
+        self
+    }
+
+    /// Set the maximum size in bytes of a single segment. Mirrors `queue_limits.max_segment_size`
+    /// (from `VIRTIO_BLK_F_SIZE_MAX`). 0 ⇒ leave the default.
+    pub fn max_segment_size(mut self, max_segment_size: u32) -> Self {
+        self.max_segment_size = max_segment_size;
+        self
+    }
+
+    /// Set the maximum sectors per request (`queue_limits.max_hw_sectors`). 0 ⇒ leave the default.
+    pub fn max_hw_sectors(mut self, max_hw_sectors: u32) -> Self {
+        self.max_hw_sectors = max_hw_sectors;
+        self
+    }
+
+    /// Set the virt boundary mask — segments are NOT merged across `mask+1`-aligned boundaries.
+    /// virtio-blk sets this to `PAGE_SIZE-1` (DMA on individual pages). Default: no boundary.
+    pub fn virt_boundary_mask(mut self, mask: u64) -> Self {
+        self.virt_boundary_mask = mask;
+        self
+    }
+
+    /// Set the block major number (from `register_blkdev`). Mirrors C `disk->major = major`.
+    pub fn major(mut self, major: u32) -> Self {
+        self.major = major;
+        self
+    }
+
+    /// Set the first minor number. Mirrors C `disk->first_minor`.
+    pub fn first_minor(mut self, first_minor: u32) -> Self {
+        self.first_minor = first_minor;
+        self
+    }
+
+    /// Set the number of minors (partitions + 1). Mirrors C `disk->minors`.
+    pub fn minors(mut self, minors: u32) -> Self {
+        self.minors = minors;
+        self
+    }
+
     /// Build a new `GenDisk` and add it to the VFS.
     pub fn build<T: Operations>(
         self,
@@ -114,6 +173,18 @@ impl GenDiskBuilder {
         lim.physical_block_size = self.physical_block_size;
         if self.rotational {
             lim.features = bindings::BLK_FEAT_ROTATIONAL;
+        }
+        if self.max_segments != 0 {
+            lim.max_segments = self.max_segments as u16;
+        }
+        if self.max_segment_size != 0 {
+            lim.max_segment_size = self.max_segment_size;
+        }
+        if self.max_hw_sectors != 0 {
+            lim.max_hw_sectors = self.max_hw_sectors;
+        }
+        if self.virt_boundary_mask != !0u64 {
+            lim.virt_boundary_mask = self.virt_boundary_mask as usize;
         }
 
         // SAFETY: `tagset.raw_tag_set()` points to a valid and initialized tag set
@@ -167,6 +238,13 @@ impl GenDiskBuilder {
         // operation, so we will not race.
         unsafe { bindings::set_capacity(gendisk, self.capacity_sectors) };
 
+        // SAFETY: `gendisk` is a valid, exclusively-owned (not yet added) `struct gendisk`.
+        unsafe {
+            (*gendisk).major = self.major as i32;
+            (*gendisk).first_minor = self.first_minor as i32;
+            (*gendisk).minors = self.minors as i32;
+        }
+
         crate::error::to_result(
             // SAFETY: `gendisk` points to a valid and initialized instance of
             // `struct gendisk`.
@@ -201,9 +279,11 @@ pub struct GenDisk<T: Operations> {
     gendisk: *mut bindings::gendisk,
 }
 
-// SAFETY: `GenDisk` is an owned pointer to a `struct gendisk` and an `Arc` to a
-// `TagSet` It is safe to send this to other threads as long as T is Send.
+// SAFETY: `GenDisk` is an owned pointer to a `struct gendisk` (kernel object) + an `Arc<TagSet>`.
+// The gendisk/queue are thread-safe (C core synchronizes). Sendable iff `T: Send`; shareable iff
+// `T: Sync`.
 unsafe impl<T: Operations + Send> Send for GenDisk<T> {}
+unsafe impl<T: Operations + Sync> Sync for GenDisk<T> {}
 
 impl<T: Operations> Drop for GenDisk<T> {
     fn drop(&mut self) {

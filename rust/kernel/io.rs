@@ -11,8 +11,10 @@ use crate::{
 
 pub mod mem;
 pub mod poll;
+pub mod port;
 pub mod resource;
 
+pub use port::{IoPort, PortRegion, UnclaimedPorts};
 pub use resource::Resource;
 
 /// Physical address type.
@@ -285,4 +287,39 @@ impl<const SIZE: usize> Io<SIZE> {
         try_write64_relaxed,
         writeq_relaxed <- u64
     );
+
+    /// Read a big-endian 32-bit value from a given offset known at compile time.
+    #[inline]
+    pub fn read32be(&self, offset: usize) -> u32 {
+        let addr = self.io_addr_assert::<u32>(offset);
+
+        // SAFETY: By the type invariant `addr` is a valid address for MMIO operations.
+        unsafe { bindings::ioread32be(addr as *const c_void) }
+    }
+
+    /// Read a big-endian 32-bit value from a runtime-checked offset.
+    pub fn try_read32be(&self, offset: usize) -> Result<u32> {
+        let addr = self.io_addr::<u32>(offset)?;
+
+        // SAFETY: By the type invariant `addr` is a valid address for MMIO operations.
+        Ok(unsafe { bindings::ioread32be(addr as *const c_void) })
+    }
+
+    /// Write a big-endian 32-bit value to a given offset known at compile time.
+    #[inline]
+    pub fn write32be(&self, value: u32, offset: usize) {
+        let addr = self.io_addr_assert::<u32>(offset);
+
+        // SAFETY: By the type invariant `addr` is a valid address for MMIO operations.
+        unsafe { bindings::iowrite32be(value, addr as *mut c_void) }
+    }
+
+    /// Write a big-endian 32-bit value to a runtime-checked offset.
+    pub fn try_write32be(&self, value: u32, offset: usize) -> Result {
+        let addr = self.io_addr::<u32>(offset)?;
+
+        // SAFETY: By the type invariant `addr` is a valid address for MMIO operations.
+        unsafe { bindings::iowrite32be(value, addr as *mut c_void) }
+        Ok(())
+    }
 }

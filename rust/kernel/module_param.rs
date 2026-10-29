@@ -7,6 +7,7 @@
 use crate::prelude::*;
 use crate::str::BStr;
 use bindings;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel::sync::SetOnce;
 
 /// Newtype to make `bindings::kernel_param` [`Sync`].
@@ -50,9 +51,8 @@ pub trait ModuleParam: Sized + Copy {
 ///
 /// - The safety requirements are satisfied by C API contract when this function is invoked by the
 ///   module subsystem C code.
-/// - Currently, we only support read-only parameters that are not readable from `sysfs`. Thus, this
-///   function is only called at kernel initialization time, or at module load time, and we have
-///   exclusive access to the parameter for the duration of the function.
+/// - This generic setter is used for load-time and read-only sysfs parameters.
+///   Writable atomic parameters use their type-specific setters below.
 ///
 /// [`module!`]: macros::module
 unsafe extern "C" fn set_param<T>(val: *const c_char, param: *const bindings::kernel_param) -> c_int
@@ -106,6 +106,34 @@ impl_int_module_param!(u64);
 impl_int_module_param!(isize);
 impl_int_module_param!(usize);
 
+impl ModuleParam for bool {
+    fn try_from_param_arg(arg: &BStr) -> Result<Self> {
+        let bytes: &[u8] = arg;
+        let Some(first) = bytes.first() else {
+            return Err(EINVAL);
+        };
+        match *first {
+            b'e' | b'E' | b'y' | b'Y' | b't' | b'T' | b'1' => Ok(true),
+            b'd' | b'D' | b'n' | b'N' | b'f' | b'F' | b'0' => Ok(false),
+            b'o' | b'O'
+                if bytes
+                    .get(1)
+                    .is_some_and(|byte| matches!(*byte, b'n' | b'N')) =>
+            {
+                Ok(true)
+            }
+            b'o' | b'O'
+                if bytes
+                    .get(1)
+                    .is_some_and(|byte| matches!(*byte, b'f' | b'F')) =>
+            {
+                Ok(false)
+            }
+            _ => Err(EINVAL),
+        }
+    }
+}
+
 /// A wrapper for kernel parameters.
 ///
 /// This type is instantiated by the [`module!`] macro when module parameters are
@@ -138,12 +166,265 @@ impl<T> ModuleParamAccess<T> {
         self.value.as_ref().unwrap_or(&self.default)
     }
 
+    /// Copy the current parameter value.
+    pub fn read(&self) -> T
+    where
+        T: Copy,
+    {
+        *self.value()
+    }
+
     /// Get a mutable pointer to `self`.
     ///
     /// NOTE: In most cases it is not safe deref the returned pointer.
     pub const fn as_void_ptr(&self) -> *mut c_void {
         core::ptr::from_ref(self).cast_mut().cast()
     }
+}
+
+/// Atomically readable and writable Boolean module parameter storage.
+///
+/// The module-parameter core serializes sysfs callbacks, while the atomic
+/// storage also makes lock-free reads from driver fast paths valid in Rust.
+#[doc(hidden)]
+pub struct WritableBoolParamAccess {
+    value: AtomicBool,
+}
+
+/// Atomically readable and writable `u32` parameter storage with validation.
+#[doc(hidden)]
+pub struct WritableU32ParamAccess {
+    value: AtomicU32,
+    minimum: u32,
+    maximum: u32,
+    possible_queues: bool,
+}
+
+impl WritableU32ParamAccess {
+    /// Create a writable value constrained to the inclusive range.
+    #[doc(hidden)]
+    pub const fn new(default: u32, minimum: u32, maximum: u32) -> Self {
+        Self {
+            value: AtomicU32::new(default),
+            minimum,
+            maximum,
+            possible_queues: false,
+        }
+    }
+
+    /// Create a queue-count parameter whose upper bound follows the current
+    /// blk-mq possible-queue topology.
+    #[doc(hidden)]
+    pub const fn possible_queues(default: u32) -> Self {
+        Self {
+            value: AtomicU32::new(default),
+            minimum: 0,
+            maximum: u32::MAX,
+            possible_queues: true,
+        }
+    }
+
+    /// Read the latest boot/module/sysfs value.
+    pub fn read(&self) -> u32 {
+        self.value.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub const fn as_void_ptr(&self) -> *mut c_void {
+        core::ptr::from_ref(self).cast_mut().cast()
+    }
+}
+
+impl WritableBoolParamAccess {
+    #[doc(hidden)]
+    pub const fn new(default: bool) -> Self {
+        Self {
+            value: AtomicBool::new(default),
+        }
+    }
+
+    /// Read the latest boot/module/sysfs value.
+    pub fn read(&self) -> bool {
+        self.value.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub const fn as_void_ptr(&self) -> *mut c_void {
+        core::ptr::from_ref(self).cast_mut().cast()
+    }
+}
+
+unsafe extern "C" fn get_i32_param(
+    buffer: *mut c_char,
+    param: *const bindings::kernel_param,
+) -> c_int {
+    if buffer.is_null() || param.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: The macro stores a `ModuleParamAccess<i32>` in `arg` and the
+    // module-parameter core keeps both objects live for this callback.
+    let access = unsafe {
+        &*((*param)
+            .__bindgen_anon_1
+            .arg
+            .cast::<ModuleParamAccess<i32>>())
+    };
+    let mut value = access.read();
+    // Reuse the kernel's canonical decimal formatter with temporary storage;
+    // it only observes `arg` during this synchronous call.
+    let mut proxy = unsafe { *param };
+    proxy.__bindgen_anon_1.arg = core::ptr::from_mut(&mut value).cast();
+    // SAFETY: `buffer` is writable by callback contract and `proxy.arg`
+    // points to a live `i32` until the formatter returns.
+    unsafe { bindings::param_get_int(buffer, &proxy) }
+}
+
+unsafe extern "C" fn get_u32_param(
+    buffer: *mut c_char,
+    param: *const bindings::kernel_param,
+) -> c_int {
+    if buffer.is_null() || param.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: The macro stores a `ModuleParamAccess<u32>` in `arg` and the
+    // module-parameter core keeps both objects live for this callback.
+    let access = unsafe {
+        &*((*param)
+            .__bindgen_anon_1
+            .arg
+            .cast::<ModuleParamAccess<u32>>())
+    };
+    let mut value = access.read();
+    let mut proxy = unsafe { *param };
+    proxy.__bindgen_anon_1.arg = core::ptr::from_mut(&mut value).cast();
+    // SAFETY: `buffer` is writable and `proxy.arg` points to a live u32 for
+    // the duration of the canonical formatter call.
+    unsafe { bindings::param_get_uint(buffer, &proxy) }
+}
+
+unsafe extern "C" fn get_bool_param(
+    buffer: *mut c_char,
+    param: *const bindings::kernel_param,
+) -> c_int {
+    if buffer.is_null() || param.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: The macro stores a `ModuleParamAccess<bool>` in `arg`.
+    let access = unsafe {
+        &*((*param)
+            .__bindgen_anon_1
+            .arg
+            .cast::<ModuleParamAccess<bool>>())
+    };
+    let mut value = access.read();
+    let mut proxy = unsafe { *param };
+    proxy.__bindgen_anon_1.arg = core::ptr::from_mut(&mut value).cast();
+    // SAFETY: Same callback and temporary-storage contract as `get_i32_param`.
+    unsafe { bindings::param_get_bool(buffer, &proxy) }
+}
+
+unsafe extern "C" fn set_writable_bool_param(
+    value: *const c_char,
+    param: *const bindings::kernel_param,
+) -> c_int {
+    if value.is_null() || param.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Module-parameter input is a live NUL-terminated string.
+    let arg: &BStr = unsafe { CStr::from_char_ptr(value) }.as_ref();
+    let parsed = match bool::try_from_param_arg(arg) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.to_errno(),
+    };
+    // SAFETY: Writable Boolean parameters store exactly this access type.
+    let access = unsafe {
+        &*((*param)
+            .__bindgen_anon_1
+            .arg
+            .cast::<WritableBoolParamAccess>())
+    };
+    access.value.store(parsed, Ordering::Release);
+    0
+}
+
+unsafe extern "C" fn get_writable_bool_param(
+    buffer: *mut c_char,
+    param: *const bindings::kernel_param,
+) -> c_int {
+    if buffer.is_null() || param.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Writable Boolean parameters store exactly this access type.
+    let access = unsafe {
+        &*((*param)
+            .__bindgen_anon_1
+            .arg
+            .cast::<WritableBoolParamAccess>())
+    };
+    let mut value = access.read();
+    let mut proxy = unsafe { *param };
+    proxy.__bindgen_anon_1.arg = core::ptr::from_mut(&mut value).cast();
+    // SAFETY: `buffer` and the temporary Boolean satisfy `param_get_bool`.
+    unsafe { bindings::param_get_bool(buffer, &proxy) }
+}
+
+unsafe extern "C" fn set_writable_u32_param(
+    value: *const c_char,
+    param: *const bindings::kernel_param,
+) -> c_int {
+    if value.is_null() || param.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Module-parameter input is a live NUL-terminated string.
+    let arg: &BStr = unsafe { CStr::from_char_ptr(value) }.as_ref();
+    let parsed = match u32::try_from_param_arg(arg) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.to_errno(),
+    };
+    // SAFETY: Writable u32 parameters store exactly this access type.
+    let access = unsafe {
+        &*((*param)
+            .__bindgen_anon_1
+            .arg
+            .cast::<WritableU32ParamAccess>())
+    };
+    if parsed < access.minimum || parsed > access.maximum {
+        return EINVAL.to_errno();
+    }
+    if access.possible_queues {
+        #[cfg(CONFIG_BLOCK)]
+        {
+            // SAFETY: Value-only query with no pointer arguments.
+            if parsed > unsafe { bindings::blk_mq_num_possible_queues(0) } {
+                return EINVAL.to_errno();
+            }
+        }
+        #[cfg(not(CONFIG_BLOCK))]
+        return EINVAL.to_errno();
+    }
+    access.value.store(parsed, Ordering::Release);
+    0
+}
+
+unsafe extern "C" fn get_writable_u32_param(
+    buffer: *mut c_char,
+    param: *const bindings::kernel_param,
+) -> c_int {
+    if buffer.is_null() || param.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Writable u32 parameters store exactly this access type.
+    let access = unsafe {
+        &*((*param)
+            .__bindgen_anon_1
+            .arg
+            .cast::<WritableU32ParamAccess>())
+    };
+    let mut value = access.read();
+    let mut proxy = unsafe { *param };
+    proxy.__bindgen_anon_1.arg = core::ptr::from_mut(&mut value).cast();
+    // SAFETY: `buffer` and the temporary u32 satisfy `param_get_uint`.
+    unsafe { bindings::param_get_uint(buffer, &proxy) }
 }
 
 #[doc(hidden)]
@@ -180,3 +461,44 @@ make_param_ops!(PARAM_OPS_I64, i64);
 make_param_ops!(PARAM_OPS_U64, u64);
 make_param_ops!(PARAM_OPS_ISIZE, isize);
 make_param_ops!(PARAM_OPS_USIZE, usize);
+make_param_ops!(PARAM_OPS_BOOL, bool);
+
+#[doc(hidden)]
+pub static PARAM_OPS_I32_READABLE: bindings::kernel_param_ops = bindings::kernel_param_ops {
+    flags: 0,
+    set: Some(set_param::<i32>),
+    get: Some(get_i32_param),
+    free: None,
+};
+
+#[doc(hidden)]
+pub static PARAM_OPS_U32_READABLE: bindings::kernel_param_ops = bindings::kernel_param_ops {
+    flags: 0,
+    set: Some(set_param::<u32>),
+    get: Some(get_u32_param),
+    free: None,
+};
+
+#[doc(hidden)]
+pub static PARAM_OPS_BOOL_READABLE: bindings::kernel_param_ops = bindings::kernel_param_ops {
+    flags: 0,
+    set: Some(set_param::<bool>),
+    get: Some(get_bool_param),
+    free: None,
+};
+
+#[doc(hidden)]
+pub static PARAM_OPS_BOOL_WRITABLE: bindings::kernel_param_ops = bindings::kernel_param_ops {
+    flags: 0,
+    set: Some(set_writable_bool_param),
+    get: Some(get_writable_bool_param),
+    free: None,
+};
+
+#[doc(hidden)]
+pub static PARAM_OPS_U32_WRITABLE: bindings::kernel_param_ops = bindings::kernel_param_ops {
+    flags: 0,
+    set: Some(set_writable_u32_param),
+    get: Some(get_writable_u32_param),
+    free: None,
+};

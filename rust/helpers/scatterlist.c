@@ -12,6 +12,13 @@ unsigned int rust_helper_sg_dma_len(struct scatterlist *sg)
 	return sg_dma_len(sg);
 }
 
+void rust_helper_sg_set_dma(struct scatterlist *sg, dma_addr_t address,
+			    unsigned int length)
+{
+	sg_dma_address(sg) = address;
+	sg_dma_len(sg) = length;
+}
+
 struct scatterlist *rust_helper_sg_next(struct scatterlist *sg)
 {
 	return sg_next(sg);

@@ -6,6 +6,7 @@
 
 use crate::{
     bindings, fmt,
+    of,
     prelude::*,
     sync::aref::ARef,
     types::{ForeignOwnable, Opaque},
@@ -14,7 +15,7 @@ use core::{any::TypeId, marker::PhantomData, ptr};
 
 #[cfg(CONFIG_PRINTK)]
 use crate::c_str;
-use crate::str::CStrExt as _;
+use crate::str::{CStr, CStrExt as _};
 
 pub mod property;
 
@@ -405,6 +406,17 @@ impl<Ctx: DeviceContext> Device<Ctx> {
         unsafe { self.printk(bindings::KERN_ERR, args) };
     }
 
+    /// Logs a probe error and returns it as an [`Error`].
+    ///
+    /// This preserves the kernel's `dev_err_probe` behavior, including probe deferral handling.
+    pub fn err_probe(&self, err: Error, msg: &CStr) -> Error {
+        // SAFETY: `self.as_raw()` is a valid `struct device *`, and `msg` is a valid C string.
+        let ret =
+            unsafe { bindings::device_err_probe(self.as_raw(), err.to_errno(), msg.as_char_ptr()) };
+
+        Error::from_errno(ret)
+    }
+
     /// Prints a warning-level message (level 4) prefixed with device information.
     ///
     /// More details are available from [`dev_warn`].
@@ -482,6 +494,82 @@ impl<Ctx: DeviceContext> Device<Ctx> {
         // `struct fwnode_handle*` to a `*const FwNode` because `FwNode` is
         // defined as a `#[repr(transparent)]` wrapper around `fwnode_handle`.
         Some(unsafe { &*fwnode_handle.cast() })
+    }
+
+    /// Obtain this device's Open Firmware node, if any.
+    pub fn of_node(&self) -> Option<&of::DeviceNode> {
+        // SAFETY: `self.as_raw()` is a valid `struct device *`.
+        let node = unsafe { (*self.as_raw()).of_node };
+        if node.is_null() {
+            return None;
+        }
+
+        // SAFETY: Device-owned OF node pointers remain valid for the lifetime of `self`.
+        Some(unsafe { of::DeviceNode::from_raw(node) })
+    }
+
+    /// NUMA node associated with this device, or `NUMA_NO_NODE`.
+    #[inline]
+    pub fn numa_node(&self) -> i32 {
+        // SAFETY: The helper performs a value-only query on a live device.
+        unsafe { bindings::dev_to_node(self.as_raw()) }
+    }
+
+    /// Configure whether this device is wakeup-capable and wakeup-enabled.
+    pub fn init_wakeup(&self, enable: bool) -> Result {
+        // SAFETY: `self.as_raw()` is a valid `struct device *`.
+        crate::error::to_result(unsafe { bindings::device_init_wakeup(self.as_raw(), enable) })
+    }
+
+    /// Configure whether this device is wakeup-capable.
+    pub fn set_wakeup_capable(&self, capable: bool) {
+        // SAFETY: `self.as_raw()` is a valid `struct device *`.
+        unsafe { bindings::device_set_wakeup_capable(self.as_raw(), capable) };
+    }
+
+    /// Return this device's kernel name.
+    pub fn name(&self) -> &CStr {
+        // SAFETY: `self.as_raw()` is valid by the type invariant.
+        let raw = self.as_raw();
+        // SAFETY: `raw` is a valid `struct device *`; the name pointers are owned by the device.
+        let name = unsafe {
+            if !(*raw).kobj.name.is_null() {
+                (*raw).kobj.name
+            } else {
+                (*raw).init_name
+            }
+        };
+
+        if name.is_null() {
+            crate::c_str!("")
+        } else {
+            // SAFETY: Kernel device names are stored as NUL-terminated C strings.
+            unsafe { CStr::from_char_ptr(name) }
+        }
+    }
+
+    /// Mark this device as being on the wakeup path for the current suspend transition.
+    pub fn set_wakeup_path(&self) {
+        // SAFETY: `self.as_raw()` is a valid `struct device *`.
+        unsafe { bindings::device_set_wakeup_path(self.as_raw()) };
+    }
+
+    /// Return whether this device is currently allowed to wake the system.
+    pub fn may_wakeup(&self) -> bool {
+        // SAFETY: `self.as_raw()` is a valid `struct device *`.
+        unsafe { bindings::device_may_wakeup(self.as_raw()) }
+    }
+
+    /// Attach a device interrupt as this device's wake IRQ.
+    pub fn set_wake_irq(&self, irq: u32) -> Result {
+        if irq > c_int::MAX as u32 {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: `self.as_raw()` is a valid `struct device *`.
+        crate::error::to_result(unsafe {
+            bindings::dev_pm_set_wake_irq(self.as_raw(), irq as c_int)
+        })
     }
 }
 

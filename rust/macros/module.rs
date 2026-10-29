@@ -111,19 +111,54 @@ impl<'a> ModInfoBuilder<'a> {
         };
 
         for param in params {
-            let ops = param_ops_path(&param.ptype);
+            let permissions = parse_permissions(&param.permissions);
+            let ops = param_ops_path(&param.ptype, permissions);
+            let writable = permissions & 0o222 != 0;
+            let (access_type, access_initializer) = match (param.ptype.as_str(), writable) {
+                ("bool", true) => (
+                    "::kernel::module_param::WritableBoolParamAccess".to_string(),
+                    format!(
+                        "::kernel::module_param::WritableBoolParamAccess::new({})",
+                        param.default
+                    ),
+                ),
+                ("u32", true) => (
+                    "::kernel::module_param::WritableU32ParamAccess".to_string(),
+                    writable_u32_initializer(param),
+                ),
+                _ => {
+                    assert!(
+                        param.validator.is_none(),
+                        "A validator is supported only for writable u32 parameters"
+                    );
+                    (
+                        format!("::kernel::module_param::ModuleParamAccess<{}>", param.ptype),
+                        format!(
+                            "::kernel::module_param::ModuleParamAccess::<{}>::new({})",
+                            param.ptype, param.default
+                        ),
+                    )
+                }
+            };
 
             // Note: The spelling of these fields is dictated by the user space
             // tool `modinfo`.
-            self.emit_param("parmtype", &param.name, &param.ptype);
-            self.emit_param("parm", &param.name, &param.description);
+            if param.modinfo_type.as_deref() != Some("") {
+                self.emit_param(
+                    "parmtype",
+                    &param.name,
+                    param.modinfo_type.as_deref().unwrap_or(&param.ptype),
+                );
+            }
+            if let Some(description) = &param.description {
+                self.emit_param("parm", &param.name, description);
+            }
 
             write!(
                 self.param_buffer,
                 "
-                pub(crate) static {param_name}:
-                    ::kernel::module_param::ModuleParamAccess<{param_type}> =
-                        ::kernel::module_param::ModuleParamAccess::new({param_default});
+                pub(crate) static {param_name}: {access_type} =
+                    {access_initializer};
 
                 const _: () = {{
                     #[link_section = \"__param\"]
@@ -148,7 +183,7 @@ impl<'a> ModInfoBuilder<'a> {
                                 #[cfg(not(MODULE))]
                                 mod_: ::core::ptr::null_mut(),
                                 ops: core::ptr::from_ref(&{ops}),
-                                perm: 0, // Will not appear in sysfs
+                                perm: {param_permissions},
                                 level: -1,
                                 flags: 0,
                                 __bindgen_anon_1: ::kernel::bindings::kernel_param__bindgen_ty_1 {{
@@ -159,9 +194,10 @@ impl<'a> ModInfoBuilder<'a> {
                 }};
                 ",
                 module_name = info.name,
-                param_type = param.ptype,
-                param_default = param.default,
+                param_permissions = format!("0o{:o}", permissions),
                 param_name = param.name,
+                access_type = access_type,
+                access_initializer = access_initializer,
                 ops = ops,
             )
             .unwrap();
@@ -169,7 +205,24 @@ impl<'a> ModInfoBuilder<'a> {
     }
 }
 
-fn param_ops_path(param_type: &str) -> &'static str {
+fn param_ops_path(param_type: &str, permissions: u16) -> &'static str {
+    if permissions & 0o222 != 0 {
+        return match param_type {
+            "bool" => "::kernel::module_param::PARAM_OPS_BOOL_WRITABLE",
+            "u32" => "::kernel::module_param::PARAM_OPS_U32_WRITABLE",
+            t => panic!("Writable parameter type {t} is not supported"),
+        };
+    }
+
+    if permissions != 0 {
+        return match param_type {
+            "i32" => "::kernel::module_param::PARAM_OPS_I32_READABLE",
+            "u32" => "::kernel::module_param::PARAM_OPS_U32_READABLE",
+            "bool" => "::kernel::module_param::PARAM_OPS_BOOL_READABLE",
+            t => panic!("Readable parameter type {t} is not supported"),
+        };
+    }
+
     match param_type {
         "i8" => "::kernel::module_param::PARAM_OPS_I8",
         "u8" => "::kernel::module_param::PARAM_OPS_U8",
@@ -181,19 +234,114 @@ fn param_ops_path(param_type: &str) -> &'static str {
         "u64" => "::kernel::module_param::PARAM_OPS_U64",
         "isize" => "::kernel::module_param::PARAM_OPS_ISIZE",
         "usize" => "::kernel::module_param::PARAM_OPS_USIZE",
+        "bool" => "::kernel::module_param::PARAM_OPS_BOOL",
         t => panic!("Unsupported parameter type {}", t),
     }
 }
 
-fn expect_param_default(param_it: &mut token_stream::IntoIter) -> String {
+fn parse_u32_literal(raw: &str) -> u32 {
+    let compact = raw.replace('_', "");
+    let (radix, digits) = if let Some(digits) = compact.strip_prefix("0x") {
+        (16, digits)
+    } else if let Some(digits) = compact.strip_prefix("0o") {
+        (8, digits)
+    } else if let Some(digits) = compact.strip_prefix("0b") {
+        (2, digits)
+    } else {
+        (10, compact.as_str())
+    };
+    u32::from_str_radix(digits, radix).expect("Invalid u32 module parameter value")
+}
+
+fn writable_u32_initializer(param: &Parameter) -> String {
+    match param.validator.as_deref() {
+        None => format!(
+            "::kernel::module_param::WritableU32ParamAccess::new({}, 0, u32::MAX)",
+            param.default
+        ),
+        Some("possible_queues") => format!(
+            "::kernel::module_param::WritableU32ParamAccess::possible_queues({})",
+            param.default
+        ),
+        Some(range) => {
+            let (minimum, maximum) = range
+                .split_once("..=")
+                .expect("u32 validator must be `minimum..=maximum` or `possible_queues`");
+            let minimum_value = parse_u32_literal(minimum);
+            let maximum_value = parse_u32_literal(maximum);
+            let default_value = parse_u32_literal(&param.default);
+            assert!(
+                minimum_value <= maximum_value,
+                "Invalid u32 validator range"
+            );
+            assert!(
+                (minimum_value..=maximum_value).contains(&default_value),
+                "Default u32 parameter value is outside its validator range"
+            );
+            format!(
+                "::kernel::module_param::WritableU32ParamAccess::new({}, {}, {})",
+                param.default, minimum, maximum
+            )
+        }
+    }
+}
+
+fn expect_param_default(param_it: &mut token_stream::IntoIter, param_type: &str) -> String {
     assert_eq!(expect_ident(param_it), "default");
     assert_eq!(expect_punct(param_it), ':');
-    let sign = try_sign(param_it);
-    let default = try_literal(param_it).expect("Expected default param value");
+    let value = if param_type == "bool" {
+        let default = expect_ident(param_it);
+        assert!(
+            default == "true" || default == "false",
+            "Expected Boolean default param value"
+        );
+        default
+    } else {
+        let sign = try_sign(param_it);
+        let default = try_literal(param_it).expect("Expected default param value");
+        let mut value = sign.map(String::from).unwrap_or_default();
+        value.push_str(&default);
+        value
+    };
     assert_eq!(expect_punct(param_it), ',');
-    let mut value = sign.map(String::from).unwrap_or_default();
-    value.push_str(&default);
     value
+}
+
+fn expect_param_permissions(param_it: &mut token_stream::IntoIter) -> String {
+    let mut probe = param_it.clone();
+    let Some(TokenTree::Ident(ident)) = probe.next() else {
+        return "0".to_string();
+    };
+    if ident.to_string() != "permissions" {
+        return "0".to_string();
+    }
+
+    assert_eq!(expect_ident(param_it), "permissions");
+    assert_eq!(expect_punct(param_it), ':');
+    let permissions = try_literal(param_it).expect("Expected module parameter permissions");
+    assert_eq!(expect_punct(param_it), ',');
+    parse_permissions(&permissions);
+    permissions
+}
+
+fn parse_permissions(raw: &str) -> u16 {
+    let compact = raw.replace('_', "");
+    let (radix, digits) = if let Some(digits) = compact.strip_prefix("0o") {
+        (8, digits)
+    } else if let Some(digits) = compact.strip_prefix("0x") {
+        (16, digits)
+    } else if let Some(digits) = compact.strip_prefix("0b") {
+        (2, digits)
+    } else {
+        (10, compact.as_str())
+    };
+    let permissions =
+        u16::from_str_radix(digits, radix).expect("Invalid module parameter permissions");
+    assert!(
+        permissions <= 0o777,
+        "Module parameter permissions must fit Unix mode bits"
+    );
+    permissions
 }
 
 #[derive(Debug, Default)]
@@ -203,6 +351,7 @@ struct ModuleInfo {
     name: String,
     authors: Option<Vec<String>>,
     description: Option<String>,
+    version: Option<String>,
     alias: Option<Vec<String>>,
     firmware: Option<Vec<String>>,
     imports_ns: Option<Vec<String>>,
@@ -214,7 +363,10 @@ struct Parameter {
     name: String,
     ptype: String,
     default: String,
-    description: String,
+    permissions: String,
+    validator: Option<String>,
+    modinfo_type: Option<String>,
+    description: Option<String>,
 }
 
 fn expect_params(it: &mut token_stream::IntoIter) -> Vec<Parameter> {
@@ -237,14 +389,44 @@ fn expect_params(it: &mut token_stream::IntoIter) -> Vec<Parameter> {
         assert_eq!(expect_punct(&mut it), ',');
 
         let mut param_it = group.stream().into_iter();
-        let param_default = expect_param_default(&mut param_it);
-        let param_description = expect_string_field(&mut param_it, "description");
+        let param_default = expect_param_default(&mut param_it, &param_type);
+        let param_permissions = expect_param_permissions(&mut param_it);
+        let param_validator = {
+            let mut probe = param_it.clone();
+            match probe.next() {
+                Some(TokenTree::Ident(ident)) if ident.to_string() == "validator" => {
+                    Some(expect_string_field(&mut param_it, "validator"))
+                }
+                _ => None,
+            }
+        };
+        let param_modinfo_type = {
+            let mut probe = param_it.clone();
+            match probe.next() {
+                Some(TokenTree::Ident(ident)) if ident.to_string() == "modinfo_type" => {
+                    Some(expect_string_field(&mut param_it, "modinfo_type"))
+                }
+                _ => None,
+            }
+        };
+        let param_description = {
+            let mut probe = param_it.clone();
+            match probe.next() {
+                Some(TokenTree::Ident(ident)) if ident.to_string() == "description" => {
+                    Some(expect_string_field(&mut param_it, "description"))
+                }
+                _ => None,
+            }
+        };
         expect_end(&mut param_it);
 
         parsed.push(Parameter {
             name: param_name,
             ptype: param_type,
             default: param_default,
+            permissions: param_permissions,
+            validator: param_validator,
+            modinfo_type: param_modinfo_type,
             description: param_description,
         })
     }
@@ -262,6 +444,7 @@ impl ModuleInfo {
             "authors",
             "description",
             "license",
+            "version",
             "alias",
             "firmware",
             "imports_ns",
@@ -289,6 +472,7 @@ impl ModuleInfo {
                 "authors" => info.authors = Some(expect_string_array(it)),
                 "description" => info.description = Some(expect_string(it)),
                 "license" => info.license = expect_string_ascii(it),
+                "version" => info.version = Some(expect_string_ascii(it)),
                 "alias" => info.alias = Some(expect_string_array(it)),
                 "firmware" => info.firmware = Some(expect_string_array(it)),
                 "imports_ns" => info.imports_ns = Some(expect_string_array(it)),
@@ -341,6 +525,9 @@ pub(crate) fn module(ts: TokenStream) -> TokenStream {
         modinfo.emit("description", description);
     }
     modinfo.emit("license", &info.license);
+    if let Some(version) = &info.version {
+        modinfo.emit("version", version);
+    }
     if let Some(aliases) = &info.alias {
         for alias in aliases {
             modinfo.emit("alias", alias);

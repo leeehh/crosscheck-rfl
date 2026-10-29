@@ -139,3 +139,71 @@ unsafe impl super::Backend for SpinLockBackend {
         unsafe { bindings::spin_assert_is_held(ptr) }
     }
 }
+
+/// A kernel `spinlock_t` backend that saves and restores IRQ state on lock/unlock, mirroring C
+/// `spin_lock_irqsave`/`spin_unlock_irqrestore`. Use for locks acquired in both IRQ and process
+/// context (e.g. a virtio vq callback in hardirq context racing a probe/remove path) — a plain
+/// [`SpinLock`] (which uses `spin_lock`, not disabling IRQs) would deadlock if an IRQ handler on the
+/// same CPU tried to re-acquire it.
+pub struct SpinLockIrqSaveBackend;
+
+/// A [`Guard`] acquired from locking a [`SpinLockIrqSave`].
+pub type SpinLockIrqSaveGuard<'a, T> = super::Guard<'a, T, SpinLockIrqSaveBackend>;
+
+/// A `spinlock_t` acquired with `spin_lock_irqsave`. See [`SpinLockIrqSaveBackend`].
+pub type SpinLockIrqSave<T> = super::Lock<T, SpinLockIrqSaveBackend>;
+
+/// Creates a [`SpinLockIrqSave`] initialiser with the given name and a newly-created lock class.
+#[macro_export]
+macro_rules! new_spinlock_irqsave {
+    ($inner:expr $(, $name:literal)? $(,)?) => {
+        $crate::sync::SpinLockIrqSave::new(
+            $inner, $crate::optional_name!($($name)?), $crate::static_lock_class!())
+    };
+}
+pub use new_spinlock_irqsave;
+
+// SAFETY: Same mutual-exclusion guarantee as `SpinLockBackend`, but `lock`/`unlock` use
+// `spin_lock_irqsave`/`spin_unlock_irqrestore` so the protected section runs with IRQs disabled on
+// the local CPU (preventing an IRQ-context re-entrant acquire from deadlocking). `GuardState` carries
+// the saved IRQ flags, restored on `unlock`.
+unsafe impl super::Backend for SpinLockIrqSaveBackend {
+    type State = bindings::spinlock_t;
+    type GuardState = crate::ffi::c_ulong;
+
+    unsafe fn init(
+        ptr: *mut Self::State,
+        name: *const crate::ffi::c_char,
+        key: *mut bindings::lock_class_key,
+    ) {
+        // SAFETY: Same as `SpinLockBackend::init`.
+        unsafe { bindings::__spin_lock_init(ptr, name, key) }
+    }
+
+    unsafe fn lock(ptr: *mut Self::State) -> Self::GuardState {
+        // SAFETY: The safety requirements of this function ensure that `ptr` points to valid,
+        // initialized memory.
+        unsafe { bindings::spin_lock_irqsave(ptr) }
+    }
+
+    unsafe fn unlock(ptr: *mut Self::State, guard_state: &Self::GuardState) {
+        // SAFETY: The safety requirements ensure `ptr` is valid and the caller owns the lock.
+        unsafe { bindings::spin_unlock_irqrestore(ptr, *guard_state) }
+    }
+
+    unsafe fn try_lock(ptr: *mut Self::State) -> Option<Self::GuardState> {
+        // SAFETY: The `ptr` pointer is guaranteed to be valid and initialized before use.
+        let mut flags: crate::ffi::c_ulong = 0;
+        let ret = unsafe { bindings::spin_trylock_irqsave(ptr, &mut flags) };
+        if ret != 0 {
+            Some(flags)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn assert_is_held(ptr: *mut Self::State) {
+        // SAFETY: The `ptr` pointer is guaranteed to be valid and initialized before use.
+        unsafe { bindings::spin_assert_is_held(ptr) }
+    }
+}

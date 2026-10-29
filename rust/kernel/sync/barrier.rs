@@ -19,6 +19,50 @@ pub(crate) fn barrier() {
     unsafe { core::arch::asm!("") };
 }
 
+/// A full mandatory memory barrier.
+///
+/// Unlike [`smp_mb`], this barrier also orders accesses against devices and is
+/// not elided on uniprocessor systems.
+#[inline(always)]
+pub fn mb() {
+    // SAFETY: `mb()` is safe to call.
+    unsafe { bindings::mb() };
+}
+
+/// A mandatory write-write memory barrier.
+///
+/// Unlike [`smp_wmb`], this barrier also orders writes against devices and is
+/// not elided on uniprocessor systems.
+#[inline(always)]
+pub fn wmb() {
+    // SAFETY: `wmb()` is safe to call.
+    unsafe { bindings::wmb() };
+}
+
+/// A mandatory read-read memory barrier.
+///
+/// Unlike [`smp_rmb`], this barrier also orders reads against devices and is
+/// not elided on uniprocessor systems.
+#[inline(always)]
+pub fn rmb() {
+    // SAFETY: `rmb()` is safe to call.
+    unsafe { bindings::rmb() };
+}
+
+/// Orders coherent DMA writes before subsequent CPU reads.
+#[inline(always)]
+pub fn dma_rmb() {
+    // SAFETY: `dma_rmb()` is safe to call.
+    unsafe { bindings::dma_rmb() };
+}
+
+/// Orders CPU writes before subsequent coherent DMA reads.
+#[inline(always)]
+pub fn dma_wmb() {
+    // SAFETY: `dma_wmb()` is safe to call.
+    unsafe { bindings::dma_wmb() };
+}
+
 /// A full memory barrier.
 ///
 /// A barrier that prevents compiler and CPU from reordering memory accesses across the barrier.

@@ -35,3 +35,26 @@ void rust_helper_spin_assert_is_held(spinlock_t *lock)
 {
 	lockdep_assert_held(lock);
 }
+
+unsigned long rust_helper_spin_lock_irqsave(spinlock_t *lock)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(lock, flags);
+	return flags;
+}
+
+void rust_helper_spin_unlock_irqrestore(spinlock_t *lock, unsigned long flags)
+{
+	spin_unlock_irqrestore(lock, flags);
+}
+
+int rust_helper_spin_trylock_irqsave(spinlock_t *lock, unsigned long *flags)
+{
+	unsigned long _flags;
+	int ret = spin_trylock_irqsave(lock, _flags);
+
+	if (ret)
+		*flags = _flags;
+	return ret;
+}

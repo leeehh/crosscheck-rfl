@@ -6,3 +6,8 @@ void rust_helper_init_completion(struct completion *x)
 {
 	init_completion(x);
 }
+
+void rust_helper_reinit_completion(struct completion *x)
+{
+	reinit_completion(x);
+}

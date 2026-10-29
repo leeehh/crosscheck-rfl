@@ -18,12 +18,14 @@
 
 use crate::{
     bindings,
-    device::{Bound, Device},
+    device::{self, Bound, Device},
     error::{from_err_ptr, to_result, Result},
+    ffi::{c_uint, c_ulong, c_void},
+    of, regmap,
     prelude::*,
 };
 
-use core::{marker::PhantomData, mem::ManuallyDrop, ptr::NonNull};
+use core::{marker::PhantomData, mem::ManuallyDrop, ptr, ptr::NonNull};
 
 mod private {
     pub trait Sealed {}
@@ -105,6 +107,318 @@ pub fn devm_enable_optional(dev: &Device<Bound>, name: &CStr) -> Result {
     to_result(unsafe {
         bindings::devm_regulator_get_enable_optional(dev.as_raw(), name.as_char_ptr())
     })
+}
+
+/// Provider-side regulator operation table.
+///
+/// This is a small safe wrapper over `struct regulator_ops` for common provider
+/// patterns. Driver-specific callback trampolines can be added incrementally as
+/// later regulator ratchets require them.
+pub struct Ops {
+    raw: bindings::regulator_ops,
+}
+
+impl Ops {
+    /// Regmap-backed voltage regulator ops with linear voltage selectors and
+    /// optional current-limit table support.
+    pub const fn regmap_linear_voltage_current() -> Self {
+        Self {
+            raw: bindings::regulator_ops {
+                list_voltage: Some(bindings::regulator_ops_list_voltage_linear),
+                set_voltage: None,
+                map_voltage: None,
+                set_voltage_sel: Some(bindings::regulator_ops_set_voltage_sel_regmap),
+                get_voltage: None,
+                get_voltage_sel: Some(bindings::regulator_ops_get_voltage_sel_regmap),
+                set_current_limit: Some(bindings::regulator_ops_set_current_limit_regmap),
+                get_current_limit: Some(bindings::regulator_ops_get_current_limit_regmap),
+                set_input_current_limit: None,
+                set_over_current_protection: None,
+                set_over_voltage_protection: None,
+                set_under_voltage_protection: None,
+                set_thermal_protection: None,
+                set_active_discharge: None,
+                enable: Some(bindings::regulator_ops_enable_regmap),
+                disable: Some(bindings::regulator_ops_disable_regmap),
+                is_enabled: Some(bindings::regulator_ops_is_enabled_regmap),
+                set_mode: None,
+                get_mode: None,
+                get_error_flags: None,
+                enable_time: None,
+                set_ramp_delay: None,
+                set_voltage_time: None,
+                set_voltage_time_sel: None,
+                set_soft_start: None,
+                get_status: None,
+                get_optimum_mode: None,
+                set_load: None,
+                set_bypass: None,
+                get_bypass: None,
+                set_suspend_voltage: None,
+                set_suspend_enable: None,
+                set_suspend_disable: None,
+                set_suspend_mode: None,
+                resume: None,
+                set_pull_down: None,
+            },
+        }
+    }
+
+    const fn as_raw(&self) -> *const bindings::regulator_ops {
+        &self.raw
+    }
+}
+
+// SAFETY: `Ops` is immutable after construction and contains only C function pointers.
+unsafe impl Sync for Ops {}
+
+/// Parameters for a linear, regmap-backed voltage regulator descriptor.
+pub struct LinearRegmapDesc {
+    /// Regulator name.
+    pub name: &'static CStr,
+    /// Regulator id.
+    pub id: i32,
+    /// Operation table.
+    pub ops: &'static Ops,
+    /// Number of voltage selectors.
+    pub n_voltages: c_uint,
+    /// Minimum voltage in microvolts.
+    pub min_uv: c_uint,
+    /// Voltage step in microvolts.
+    pub uv_step: c_uint,
+    /// Voltage selector register.
+    pub vsel_reg: c_uint,
+    /// Voltage selector mask.
+    pub vsel_mask: c_uint,
+    /// Enable register.
+    pub enable_reg: c_uint,
+    /// Enable mask.
+    pub enable_mask: c_uint,
+    /// Optional current-limit selector table.
+    pub current_limits: Option<&'static [c_uint]>,
+    /// Current selector register.
+    pub csel_reg: c_uint,
+    /// Current selector mask.
+    pub csel_mask: c_uint,
+}
+
+/// Static provider-side regulator descriptor.
+pub struct Descriptor {
+    raw: bindings::regulator_desc,
+}
+
+impl Descriptor {
+    /// Create a descriptor for a linear voltage regulator controlled through regmap.
+    pub const fn regmap_linear_voltage_current(desc: LinearRegmapDesc) -> Self {
+        let (curr_table, n_current_limits) = match desc.current_limits {
+            Some(table) => (table.as_ptr(), table.len() as c_uint),
+            None => (ptr::null(), 0),
+        };
+
+        Self {
+            raw: bindings::regulator_desc {
+                name: crate::str::as_char_ptr_in_const_context(desc.name),
+                supply_name: ptr::null(),
+                of_match: ptr::null(),
+                of_match_full_name: false,
+                regulators_node: ptr::null(),
+                of_parse_cb: None,
+                init_cb: None,
+                id: desc.id,
+                _bitfield_align_1: [],
+                _bitfield_1: bindings::__BindgenBitfieldUnit::new([0u8; 1]),
+                n_voltages: desc.n_voltages,
+                n_current_limits,
+                ops: desc.ops.as_raw(),
+                irq: 0,
+                type_: bindings::regulator_type_REGULATOR_VOLTAGE,
+                owner: ptr::null_mut(),
+                min_uV: desc.min_uv,
+                uV_step: desc.uv_step,
+                linear_min_sel: 0,
+                fixed_uV: 0,
+                ramp_delay: 0,
+                min_dropout_uV: 0,
+                linear_ranges: ptr::null(),
+                linear_range_selectors_bitfield: ptr::null(),
+                n_linear_ranges: 0,
+                volt_table: ptr::null(),
+                curr_table,
+                vsel_range_reg: 0,
+                vsel_range_mask: 0,
+                range_applied_by_vsel: false,
+                vsel_reg: desc.vsel_reg,
+                vsel_mask: desc.vsel_mask,
+                vsel_step: 0,
+                csel_reg: desc.csel_reg,
+                csel_mask: desc.csel_mask,
+                apply_reg: 0,
+                apply_bit: 0,
+                enable_reg: desc.enable_reg,
+                enable_mask: desc.enable_mask,
+                enable_val: 0,
+                disable_val: 0,
+                enable_is_inverted: false,
+                bypass_reg: 0,
+                bypass_mask: 0,
+                bypass_val_on: 0,
+                bypass_val_off: 0,
+                active_discharge_on: 0,
+                active_discharge_off: 0,
+                active_discharge_mask: 0,
+                active_discharge_reg: 0,
+                soft_start_reg: 0,
+                soft_start_mask: 0,
+                soft_start_val_on: 0,
+                pull_down_reg: 0,
+                pull_down_mask: 0,
+                pull_down_val_on: 0,
+                ramp_reg: 0,
+                ramp_mask: 0,
+                ramp_delay_table: ptr::null(),
+                n_ramp_values: 0,
+                enable_time: 0,
+                off_on_delay: 0,
+                poll_enabled_time: 0,
+                of_map_mode: None,
+            },
+        }
+    }
+
+    fn as_raw(&self) -> *const bindings::regulator_desc {
+        &self.raw
+    }
+}
+
+// SAFETY: `Descriptor` is immutable after construction and only contains static
+// pointers supplied by the driver.
+unsafe impl Sync for Descriptor {}
+
+/// Regulator initialization data returned by firmware parsing.
+pub struct InitData {
+    ptr: *mut bindings::regulator_init_data,
+}
+
+impl InitData {
+    /// Parse regulator init data from an Open Firmware node.
+    pub fn from_of<Ctx: device::DeviceContext>(
+        dev: &Device<Ctx>,
+        node: Option<&of::DeviceNode>,
+        desc: &Descriptor,
+    ) -> Option<Self> {
+        let node = node.map_or(ptr::null_mut(), |node| node.as_raw());
+
+        // SAFETY: `dev`, optional `node`, and `desc` are valid borrowed kernel objects.
+        let ptr = unsafe { bindings::regulator_of_get_init_data(dev.as_raw(), node, desc.as_raw()) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr })
+        }
+    }
+}
+
+/// Dynamic provider-side regulator registration config.
+pub struct Config<'a> {
+    raw: bindings::regulator_config,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+impl<'a> Config<'a> {
+    /// Create a zeroed config for `dev`.
+    pub fn new<Ctx: device::DeviceContext>(dev: &Device<Ctx>) -> Self {
+        let mut raw = bindings::regulator_config::default();
+        raw.dev = dev.as_raw();
+        Self {
+            raw,
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// Set firmware/platform initialization data.
+    pub fn set_init_data(&mut self, init_data: Option<&InitData>) -> &mut Self {
+        self.raw.init_data = init_data.map_or(ptr::null(), |data| data.ptr);
+        self
+    }
+
+    /// Set driver data stored in `struct regulator_config`.
+    pub fn set_driver_data<T>(&mut self, data: &'a T) -> &mut Self {
+        self.raw.driver_data = (data as *const T).cast_mut().cast::<c_void>();
+        self
+    }
+
+    /// Set the regmap backing the common regmap regulator ops.
+    pub fn set_regmap(&mut self, map: regmap::RegMap) -> &mut Self {
+        self.raw.regmap = map.as_raw();
+        self
+    }
+
+    /// Set the OF node associated with this regulator.
+    pub fn set_of_node(&mut self, node: Option<&of::DeviceNode>) -> &mut Self {
+        self.raw.of_node = node.map_or(ptr::null_mut(), |node| node.as_raw());
+        self
+    }
+
+    fn as_raw(&self) -> *const bindings::regulator_config {
+        &self.raw
+    }
+}
+
+/// Device-managed provider-side regulator registration.
+pub struct RegulatorDev<'a> {
+    ptr: NonNull<bindings::regulator_dev>,
+    _lifetime: PhantomData<&'a Descriptor>,
+}
+
+impl<'a> RegulatorDev<'a> {
+    /// Register a regulator provider with devres-managed cleanup.
+    pub fn devm_register<Ctx: device::DeviceContext>(
+        dev: &Device<Ctx>,
+        desc: &'a Descriptor,
+        config: &Config<'a>,
+    ) -> Result<Self> {
+        // SAFETY: `dev`, `desc`, and `config` are valid for this registration. The C regulator
+        // core/devres owns the returned `regulator_dev`.
+        let ptr = from_err_ptr(unsafe {
+            bindings::regulator_devm_register(dev.as_raw(), desc.as_raw(), config.as_raw())
+        })?;
+        let ptr = NonNull::new(ptr).ok_or(ENODEV)?;
+
+        Ok(Self {
+            ptr,
+            _lifetime: PhantomData,
+        })
+    }
+
+    /// Notify regulator consumers about an event.
+    pub fn notify(&self, event: Event) -> Result {
+        // SAFETY: `self.ptr` is a valid `struct regulator_dev *`; no event payload is supplied.
+        to_result(unsafe {
+            bindings::regulator_notify(self.ptr.as_ptr(), event.0, ptr::null_mut())
+        })
+    }
+
+}
+
+// SAFETY: `RegulatorDev` is a devres-managed registration handle tied to its device.
+unsafe impl Send for RegulatorDev<'_> {}
+
+// SAFETY: Shared references only expose notifier calls and the stable raw pointer.
+unsafe impl Sync for RegulatorDev<'_> {}
+
+/// Regulator notifier event.
+#[derive(Clone, Copy)]
+pub struct Event(c_ulong);
+
+impl Event {
+    /// Over-current event.
+    pub const OVER_CURRENT: Self = Self(bindings::REGULATOR_EVENT_OVER_CURRENT as c_ulong);
+    /// Under-voltage event.
+    pub const UNDER_VOLTAGE: Self = Self(bindings::REGULATOR_EVENT_UNDER_VOLTAGE as c_ulong);
+    /// Over-temperature event.
+    pub const OVER_TEMP: Self = Self(bindings::REGULATOR_EVENT_OVER_TEMP as c_ulong);
+    /// Regulation-out event.
+    pub const REGULATION_OUT: Self = Self(bindings::REGULATOR_EVENT_REGULATION_OUT as c_ulong);
 }
 
 /// A `struct regulator` abstraction.

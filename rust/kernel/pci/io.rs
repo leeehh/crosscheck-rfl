@@ -4,17 +4,323 @@
 
 use super::Device;
 use crate::{
-    bindings,
-    device,
+    bindings, device,
     devres::Devres,
+    error::to_result,
     io::{
         Io,
         IoRaw, //
     },
     prelude::*,
-    sync::aref::ARef, //
+    sync::{aref::ARef, SpinLockIrqSave},
 };
-use core::ops::Deref;
+use core::{mem, ops::Deref, ptr::NonNull};
+use pin_init::{pin_data, PinInit};
+
+/// An exclusive claim on all memory BARs of a PCI function.
+///
+/// This is intentionally separate from [`RemappableBar`]: NVMe claims its BAR
+/// resources once at probe time but may replace the CPU mapping of BAR 0 as
+/// the required doorbell window grows during queue setup.
+pub struct MemoryRegions {
+    pdev: ARef<Device>,
+}
+
+impl Drop for MemoryRegions {
+    fn drop(&mut self) {
+        // SAFETY: Construction succeeds only after the matching request, and
+        // the retained device reference keeps `pdev` alive through release.
+        unsafe { bindings::pci_release_mem_regions(self.pdev.as_raw()) };
+    }
+}
+
+/// An allocation from a PCI peer-to-peer memory pool.
+///
+/// The allocation is CPU accessible and has a bus address suitable for the
+/// owning PCI function's submission queue. It is returned to the P2P pool on
+/// drop.
+pub struct P2pAllocation {
+    pdev: ARef<Device>,
+    address: NonNull<c_void>,
+    bus_address: bindings::pci_bus_addr_t,
+    size: usize,
+}
+
+// SAFETY: Ownership of the allocation is unique. Mutable CPU access requires
+// `&mut self`; immutable methods expose only scalar metadata.
+unsafe impl Send for P2pAllocation {}
+// SAFETY: See `Send`; no shared method dereferences the allocation.
+unsafe impl Sync for P2pAllocation {}
+
+impl P2pAllocation {
+    /// Allocate `size` bytes from this function's published P2P pool.
+    pub fn new(pdev: &Device, size: usize) -> Result<Self> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: `pdev` is live and the PCI P2P allocator validates the
+        // requested size against its registered resources.
+        let address = unsafe { bindings::pci_alloc_p2pmem(pdev.as_raw(), size) };
+        let Some(address) = NonNull::new(address) else {
+            return Err(ENOMEM);
+        };
+        // SAFETY: `address` is the live allocation returned immediately above.
+        let bus_address =
+            unsafe { bindings::pci_p2pmem_virt_to_bus(pdev.as_raw(), address.as_ptr()) };
+        if bus_address == 0 {
+            // SAFETY: This is the unique allocation and no pointer escaped.
+            unsafe { bindings::pci_free_p2pmem(pdev.as_raw(), address.as_ptr(), size) };
+            return Err(EIO);
+        }
+        Ok(Self {
+            pdev: pdev.into(),
+            address,
+            bus_address,
+            size,
+        })
+    }
+
+    /// Bus address of the first byte.
+    pub fn bus_address(&self) -> bindings::pci_bus_addr_t {
+        self.bus_address
+    }
+
+    /// Allocation size in bytes.
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Whether the allocation is empty (always false for a constructed value).
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Copy bytes into the CPU mapping at `offset`.
+    pub fn copy_from(&mut self, offset: usize, source: &[u8]) -> Result {
+        let end = offset.checked_add(source.len()).ok_or(EINVAL)?;
+        if end > self.size {
+            return Err(EINVAL);
+        }
+        // SAFETY: Bounds were checked, `&mut self` guarantees exclusive CPU
+        // access and both ranges are valid for `source.len()` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                source.as_ptr(),
+                self.address.as_ptr().cast::<u8>().add(offset),
+                source.len(),
+            )
+        };
+        Ok(())
+    }
+
+    /// Zero a byte range in the allocation.
+    pub fn zero(&mut self, offset: usize, len: usize) -> Result {
+        let end = offset.checked_add(len).ok_or(EINVAL)?;
+        if end > self.size {
+            return Err(EINVAL);
+        }
+        // SAFETY: Bounds were checked and `&mut self` guarantees exclusive
+        // CPU access.
+        unsafe {
+            self.address
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset)
+                .write_bytes(0, len)
+        };
+        Ok(())
+    }
+}
+
+impl Drop for P2pAllocation {
+    fn drop(&mut self) {
+        // SAFETY: This object uniquely owns the allocation and retained the
+        // device reference used to allocate it.
+        unsafe { bindings::pci_free_p2pmem(self.pdev.as_raw(), self.address.as_ptr(), self.size) };
+    }
+}
+
+struct RawBarMapping {
+    io: IoRaw,
+}
+
+impl RawBarMapping {
+    fn map(start: bindings::resource_size_t, resource_len: usize, size: usize) -> Result<Self> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        if size > resource_len {
+            return Err(EINVAL);
+        }
+        // SAFETY: The caller owns the BAR resource and the checked range lies
+        // wholly within it. `ioremap` validates architecture-specific details.
+        let address = unsafe { bindings::ioremap(start, size) };
+        if address.is_null() {
+            return Err(ENOMEM);
+        }
+        Ok(Self {
+            io: IoRaw::new(address as usize, size)?,
+        })
+    }
+
+    fn io(&self) -> &Io {
+        // SAFETY: `RawBarMapping` owns an active `ioremap` of exactly
+        // `self.io.maxsize()` bytes until its `Drop` runs.
+        unsafe { Io::from_raw(&self.io) }
+    }
+}
+
+impl Drop for RawBarMapping {
+    fn drop(&mut self) {
+        // SAFETY: `self.io.addr()` is the mapping returned by `ioremap` in
+        // `RawBarMapping::map`, and this object owns it uniquely.
+        unsafe { bindings::iounmap(self.io.addr() as *mut c_void) };
+    }
+}
+
+/// A BAR prefix whose `ioremap` can be safely replaced while interrupts are
+/// quiesced.
+///
+/// Every MMIO access briefly holds an irq-save spinlock. A remap allocates the
+/// new mapping before taking that lock, swaps mappings under the lock, and
+/// unmaps the old range afterwards. Consequently interrupt-context users can
+/// never observe an unmapped pointer, a hard IRQ cannot re-enter an access on
+/// the same CPU, and the potentially sleeping `ioremap`/`iounmap` operations
+/// never execute while the spinlock is held.
+#[pin_data]
+pub struct RemappableBar {
+    _pdev: ARef<Device>,
+    resource_start: bindings::resource_size_t,
+    resource_len: usize,
+    #[pin]
+    mapping: SpinLockIrqSave<Option<RawBarMapping>>,
+}
+
+impl RemappableBar {
+    /// Map the first `size` bytes of `bar`.
+    pub fn new<'a>(
+        pdev: &'a Device<device::Core>,
+        bar_index: u32,
+        size: usize,
+    ) -> impl PinInit<Self, Error> + 'a {
+        try_pin_init!(Self {
+            _pdev: pdev.into(),
+            resource_start: pdev.resource_start(bar_index)?,
+            resource_len: usize::try_from(pdev.resource_len(bar_index)?)?,
+            mapping <- crate::new_spinlock_irqsave!(Some(RawBarMapping::map(
+                pdev.resource_start(bar_index)?,
+                usize::try_from(pdev.resource_len(bar_index)?)?,
+                size,
+            )?)),
+        })
+    }
+
+    /// Replace the current mapping with a prefix of `size` bytes.
+    ///
+    /// The transport must first stop hardware users whose multi-register
+    /// transactions require stronger serialization than an individual access.
+    pub fn remap(&self, size: usize) -> Result {
+        let next = RawBarMapping::map(self.resource_start, self.resource_len, size)?;
+        let previous = {
+            let mut mapping = self.mapping.lock();
+            mem::replace(&mut *mapping, Some(next))
+        };
+        drop(previous);
+        Ok(())
+    }
+
+    /// Unmap the BAR prefix. Further accesses fail with [`ENODEV`].
+    pub fn unmap(&self) {
+        let previous = {
+            let mut mapping = self.mapping.lock();
+            mapping.take()
+        };
+        drop(previous);
+    }
+
+    /// Full BAR resource length, independent of the current mapped prefix.
+    pub fn resource_len(&self) -> usize {
+        self.resource_len
+    }
+
+    /// Length of the current mapping, or zero when unmapped.
+    pub fn mapped_len(&self) -> usize {
+        self.mapping
+            .lock()
+            .as_ref()
+            .map(|mapping| mapping.io.maxsize())
+            .unwrap_or(0)
+    }
+
+    /// Read a little-endian 32-bit register at a runtime-checked offset.
+    #[inline]
+    pub fn read32(&self, offset: usize) -> Result<u32> {
+        let mapping = self.mapping.lock();
+        mapping.as_ref().ok_or(ENODEV)?.io().try_read32(offset)
+    }
+
+    /// Write a little-endian 32-bit register at a runtime-checked offset.
+    #[inline]
+    pub fn write32(&self, value: u32, offset: usize) -> Result {
+        let mapping = self.mapping.lock();
+        mapping
+            .as_ref()
+            .ok_or(ENODEV)?
+            .io()
+            .try_write32(value, offset)
+    }
+
+    /// Read a 64-bit register as low dword followed by high dword.
+    pub fn read64_lo_hi(&self, offset: usize) -> Result<u64> {
+        let mapping = self.mapping.lock();
+        let io = mapping.as_ref().ok_or(ENODEV)?.io();
+        let low = io.try_read32(offset)? as u64;
+        let high = io.try_read32(offset.checked_add(4).ok_or(EINVAL)?)? as u64;
+        Ok(low | (high << 32))
+    }
+
+    /// Write a 64-bit register as high dword followed by low dword.
+    pub fn write64_hi_lo(&self, value: u64, offset: usize) -> Result {
+        let mapping = self.mapping.lock();
+        let io = mapping.as_ref().ok_or(ENODEV)?.io();
+        io.try_write32((value >> 32) as u32, offset.checked_add(4).ok_or(EINVAL)?)?;
+        io.try_write32(value as u32, offset)
+    }
+
+    /// Copy bytes to MMIO at a runtime-checked offset.
+    pub fn copy_to(&self, offset: usize, source: &[u8]) -> Result {
+        let mapping = self.mapping.lock();
+        let io = mapping.as_ref().ok_or(ENODEV)?.io();
+        let end = offset.checked_add(source.len()).ok_or(EINVAL)?;
+        if end > io.maxsize() {
+            return Err(EINVAL);
+        }
+        // SAFETY: Bounds were checked against the live mapping while its lock
+        // is held; `source` is readable for its full length.
+        unsafe {
+            bindings::memcpy_toio(
+                (io.addr() + offset) as *mut c_void,
+                source.as_ptr().cast(),
+                source.len(),
+            )
+        };
+        Ok(())
+    }
+
+    /// Zero a byte range in MMIO.
+    pub fn zero(&self, offset: usize, len: usize) -> Result {
+        let mapping = self.mapping.lock();
+        let io = mapping.as_ref().ok_or(ENODEV)?.io();
+        let end = offset.checked_add(len).ok_or(EINVAL)?;
+        if end > io.maxsize() {
+            return Err(EINVAL);
+        }
+        // SAFETY: Bounds were checked against the live mapping while its lock
+        // is held.
+        unsafe { bindings::memset_io((io.addr() + offset) as *mut c_void, 0, len) };
+        Ok(())
+    }
+}
 
 /// A PCI BAR to perform I/O-Operations on.
 ///
@@ -140,5 +446,17 @@ impl Device<device::Bound> {
         name: &'a CStr,
     ) -> impl PinInit<Devres<Bar>, Error> + 'a {
         self.iomap_region_sized::<0>(bar, name)
+    }
+}
+
+impl Device<device::Core> {
+    /// Claim every memory BAR of this PCI function until the returned guard is
+    /// dropped.
+    pub fn request_mem_regions(&self, name: &CStr) -> Result<MemoryRegions> {
+        // SAFETY: `self` is a live PCI function in probe context and `name` is
+        // NUL terminated. The guard balances this successful request exactly
+        // once.
+        to_result(unsafe { bindings::pci_request_mem_regions(self.as_raw(), name.as_char_ptr()) })?;
+        Ok(MemoryRegions { pdev: self.into() })
     }
 }
