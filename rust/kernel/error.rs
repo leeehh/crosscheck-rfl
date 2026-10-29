@@ -435,6 +435,7 @@ pub type Result<T = (), E = Error> = core::result::Result<T, E>;
 /// ```
 ///
 /// [`?`]: https://doc.rust-lang.org/reference/expressions/operator-expr.html#the-question-mark-operator
+#[inline(always)]
 pub fn to_result(err: crate::ffi::c_int) -> Result {
     if err < 0 {
         Err(Error::from_errno(err))

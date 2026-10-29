@@ -956,15 +956,24 @@ impl<T: Operations> Controller<T> {
     /// Whether the controller supports data SGLs for this transport.
     #[inline]
     pub fn supports_sgl(&self) -> bool {
-        // SAFETY: The helper performs capability checks on a live controller.
-        unsafe { bindings::nvme_ctrl_sgl_supported(self.ctrl.get()) }
+        // SAFETY: As in nvme_ctrl_sgl_supported(), the Identify capability is
+        // stable while requests are dispatched; reset quiesces those requests.
+        let sgls = unsafe { (*self.ctrl.get()).sgls };
+        sgls & (bindings::NVME_CTRL_SGLS_BYTE_ALIGNED
+            | bindings::NVME_CTRL_SGLS_DWORD_ALIGNED) != 0
     }
 
     /// Whether the controller supports metadata SGLs.
     #[inline]
     pub fn supports_metadata_sgl(&self) -> bool {
-        // SAFETY: The helper performs capability checks on a live controller.
-        unsafe { bindings::nvme_ctrl_meta_sgl_supported(self.ctrl.get()) }
+        // Controller initialization installs T's operations table, so its
+        // flags are the same flags tested by nvme_ctrl_meta_sgl_supported().
+        if T::FLAGS & bindings::NVME_F_FABRICS != 0 {
+            return true;
+        }
+        // SAFETY: The Identify capability is stable during queue dispatch, as
+        // in the C helper. Reset changes it only while requests are quiesced.
+        unsafe { (*self.ctrl.get()).sgls & bindings::NVME_CTRL_SGLS_MSDS != 0 }
     }
 
     /// Whether the core currently owns an admin request queue.
@@ -2105,6 +2114,20 @@ struct RequestPdu<D> {
     data: D,
 }
 
+/// Inline equivalent of blk_rq_nr_phys_segments(), including its special
+/// payload override. All callers own the live request for the callback.
+#[inline]
+unsafe fn request_phys_segments(request: *const bindings::request) -> u32 {
+    // SAFETY: The caller supplies a live, callback-owned C request header.
+    // This borrow does not cover the separately typed PDU that follows it.
+    let request = unsafe { &*request };
+    if request.rq_flags & (1 << bindings::rqf_flags___RQF_SPECIAL_PAYLOAD) != 0 {
+        1
+    } else {
+        u32::from(request.nr_phys_segments)
+    }
+}
+
 /// A request borrowed from blk-mq for the duration of a callback.
 pub struct MqRequest<'a, O: MqOperations> {
     raw: NonNull<bindings::request>,
@@ -2121,9 +2144,13 @@ impl<'a, O: MqOperations> MqRequest<'a, O> {
 
     #[inline]
     fn pdu_ptr(&self) -> *mut RequestPdu<O::RequestData> {
-        // SAFETY: Every request associated with `O` was allocated by
-        // `TagSet<O>` with exactly this PDU layout.
-        unsafe { bindings::blk_mq_rq_to_pdu(self.raw.as_ptr()) }.cast()
+        // SAFETY: blk_mq_rq_to_pdu() is exactly `rq + 1` in blk-mq.h.
+        // blk-mq allocates the request and `cmd_size` bytes in one allocation;
+        // TagSet<O> reserves RequestPdu<O::RequestData> there and verifies that
+        // its alignment does not exceed the request's alignment. The binding
+        // supplies the actual C request size, so no layout offset is hard-coded.
+        // This callback borrow keeps that allocation live for all PDU accesses.
+        unsafe { self.raw.as_ptr().add(1).cast() }
     }
 
     /// Driver-private per-request state.
@@ -2188,6 +2215,28 @@ impl<'a, O: MqOperations> MqRequest<'a, O> {
         unsafe { (*hctx).driver_data.cast::<O::HctxData>().as_ref() }
     }
 
+    /// Map a single data vector directly in this request's private mapping slot.
+    ///
+    /// `select` returns the mapping field in the request's transport data. The
+    /// request token is captured before borrowing that field, so no overlapping
+    /// mutable request/data references are created and the mapping need not be
+    /// moved out and copied back. Mapping checks and unmap ownership are the
+    /// same as [`RequestDmaMapping::map_single_data_bvec`].
+    #[inline]
+    pub fn map_single_data_in_place(
+        &mut self,
+        dev: &device::Device,
+        select: fn(&mut O::RequestData) -> &mut RequestDmaMapping<O>,
+        should_map: impl FnOnce(u32, u32) -> bool,
+    ) -> core::result::Result<Option<DmaBvecSegment>, BlockStatus> {
+        let raw = self.raw;
+        let mapping = select(self.data_mut());
+        // SAFETY: This exclusive callback borrow keeps the request live. The
+        // selected mapping is borrowed from its disjoint PDU region and
+        // the raw implementation reads only the C request/bio, not RequestData.
+        unsafe { mapping.map_single_data_bvec_raw(raw, dev, should_map) }
+    }
+
     /// blk-mq request tag.
     #[inline]
     pub fn tag(&self) -> u16 {
@@ -2207,7 +2256,7 @@ impl<'a, O: MqOperations> MqRequest<'a, O> {
     #[inline]
     pub fn nr_phys_segments(&self) -> u32 {
         // SAFETY: `raw` is a live request for this callback.
-        unsafe { bindings::blk_rq_nr_phys_segments(self.raw.as_ptr()) as u32 }
+        unsafe { request_phys_segments(self.raw.as_ptr()) }
     }
 
     /// Total request payload bytes after block-layer slicing.
@@ -2221,8 +2270,20 @@ impl<'a, O: MqOperations> MqRequest<'a, O> {
     /// payload without SGLs.
     #[inline]
     pub fn physical_gap_mask(&self) -> usize {
-        // SAFETY: Value-only helper on a live request.
-        unsafe { bindings::req_phys_gap_mask(self.raw.as_ptr()) as usize }
+        // SAFETY: The callback owns this request, so the block layer cannot
+        // change its segment-gap encoding during command preparation.
+        let bit = unsafe { self.raw.as_ref().phys_gap_bit };
+        if bit < 31 {
+            // req_phys_gap_mask uses a signed C int shift. For 0..=30 the
+            // expression below has exactly the same (sign-extended) mask;
+            // wrapping_sub preserves the zero-gap encoding at bit == 0.
+            !(((1usize << bit) >> 1).wrapping_sub(1))
+        } else {
+            // Keep the architecture's existing C behavior at the signed-shift
+            // boundary instead of introducing a new interpretation here.
+            // SAFETY: The request remains live for this value-only helper.
+            unsafe { bindings::req_phys_gap_mask(self.raw.as_ptr()) as usize }
+        }
     }
 
     /// Whether this request carries integrity metadata.
@@ -2482,6 +2543,8 @@ impl DmaMapKind {
 /// is idempotent and fails closed by removing any still-active mapping.
 pub struct RequestDmaMapping<O: MqOperations> {
     request: Option<NonNull<bindings::request>>,
+    // Retained while idle as well as active. Reusing a request tag on the same
+    // device must not take/drop an identical device reference on every I/O.
     dev: Option<ARef<device::Device>>,
     state: bindings::dma_iova_state,
     direction: Option<dma::DataDirection>,
@@ -2525,6 +2588,15 @@ impl<O: MqOperations> RequestDmaMapping<O> {
             iteration_status: BLK_STS_OK,
             _p: PhantomData,
         }
+    }
+
+    /// Retain the DMA device until this reusable slot is destroyed. The caller
+    /// has already rejected active mappings; an idle slot may change devices.
+    fn cache_device(&mut self, dev: &device::Device) {
+        if self.dev.as_ref().is_some_and(|cached| cached.as_raw() == dev.as_raw()) {
+            return;
+        }
+        self.dev = Some(dev.into());
     }
 
     /// Map the first integrity bio vector for a direct NVMe metadata pointer.
@@ -2577,8 +2649,8 @@ impl<O: MqOperations> RequestDmaMapping<O> {
             length: vector.bv_len,
             _padding: 0,
         };
+        self.cache_device(dev);
         self.request = Some(request.raw);
-        self.dev = Some(dev.into());
         self.state = bindings::dma_iova_state::default();
         self.direction = Some(direction);
         self.payload = Some(DmaPayload::Metadata);
@@ -2607,14 +2679,32 @@ impl<O: MqOperations> RequestDmaMapping<O> {
         dev: &device::Device,
         should_map: impl FnOnce(u32, u32) -> bool,
     ) -> core::result::Result<Option<DmaBvecSegment>, BlockStatus> {
+        // SAFETY: The callback exclusively owns this live request. `self` is
+        // separate from the borrowed request wrapper and its private data.
+        unsafe { self.map_single_data_bvec_raw(request.raw, dev, should_map) }
+    }
+
+    /// # Safety
+    ///
+    /// `request` must be live and exclusively owned by the queue callback.
+    /// The implementation must not construct a request/data reference: its
+    /// caller may already hold a mutable borrow of a field in RequestData.
+    unsafe fn map_single_data_bvec_raw(
+        &mut self,
+        request: NonNull<bindings::request>,
+        dev: &device::Device,
+        should_map: impl FnOnce(u32, u32) -> bool,
+    ) -> core::result::Result<Option<DmaBvecSegment>, BlockStatus> {
         if self.request.is_some() {
             return Err(BLK_STS_DEV_RESOURCE);
         }
-        if request.nr_phys_segments() != 1 {
+        // SAFETY: The callback owns this live request; this accessor reads
+        // only the C request header, disjoint from the private mapping slot.
+        if unsafe { request_phys_segments(request.as_ptr()) } != 1 {
             return Err(BLK_STS_IOERR);
         }
 
-        let raw = request.raw.as_ptr();
+        let raw = request.as_ptr();
         // SAFETY: `raw` is a live one-segment data request exclusively owned
         // by this callback; the helper returns its first bio vector by value.
         let mut vector = unsafe { bindings::req_bvec(raw) };
@@ -2650,8 +2740,8 @@ impl<O: MqOperations> RequestDmaMapping<O> {
             length: vector.bv_len,
             _padding: 0,
         };
-        self.request = Some(request.raw);
-        self.dev = Some(dev.into());
+        self.cache_device(dev);
+        self.request = Some(request);
         self.state = bindings::dma_iova_state::default();
         self.direction = Some(direction);
         self.payload = Some(DmaPayload::Data);
@@ -2733,8 +2823,8 @@ impl<O: MqOperations> RequestDmaMapping<O> {
                 && bindings::dma_need_unmap(dev.as_raw())
         };
 
+        self.cache_device(dev);
         self.request = Some(request.raw);
-        self.dev = Some(dev.into());
         self.state = state;
         self.direction = Some(direction);
         self.payload = Some(payload);
@@ -2826,7 +2916,8 @@ impl<O: MqOperations> RequestDmaMapping<O> {
 
     fn clear_mapping_state(&mut self) {
         self.request = None;
-        self.dev = None;
+        // Keep the device reference for the next use of this request slot.
+        // DMA mappings and all descriptor resources are still released now.
         self.state = bindings::dma_iova_state::default();
         self.direction = None;
         self.payload = None;
@@ -2858,7 +2949,7 @@ impl<O: MqOperations> RequestDmaMapping<O> {
             return;
         }
         let (Some(request), Some(dev), Some(direction)) =
-            (self.request.take(), self.dev.take(), self.direction.take())
+            (self.request.take(), self.dev.as_ref(), self.direction.take())
         else {
             return;
         };
@@ -2922,7 +3013,7 @@ impl<O: MqOperations> RequestDmaMapping<O> {
     /// no-op.
     pub fn unmap(&mut self) {
         let (Some(request), Some(dev), Some(direction)) =
-            (self.request.take(), self.dev.take(), self.direction.take())
+            (self.request.take(), self.dev.as_ref(), self.direction.take())
         else {
             return;
         };
@@ -4071,7 +4162,11 @@ impl<O: MqOperations> TagSet<O> {
         // advances the command-id generation, then lets blk-mq choose direct,
         // remote, or batched completion.
         let deferred = unsafe {
-            let core = bindings::blk_mq_rq_to_pdu(request).cast::<bindings::nvme_request>();
+            // As in blk_mq_rq_to_pdu(), the NVMe PDU immediately follows
+            // this live request in the tag-set allocation. The generated
+            // request type provides the C stride; RequestPdu is repr(C) and
+            // its first member is the NVMe core prefix.
+            let core = request.add(1).cast::<bindings::nvme_request>();
             let controller = (*core).ctrl;
             if controller.is_null() {
                 return CompletionDisposition::InvalidCommandId;
@@ -4085,8 +4180,15 @@ impl<O: MqOperations> TagSet<O> {
             #[cfg(CONFIG_FAULT_INJECTION_DEBUG_FS)]
             bindings::nvme_should_fail(request);
 
-            bindings::blk_should_fake_timeout((*request).q)
-                || bindings::blk_mq_complete_request_remote(request)
+            // Match blk_should_fake_timeout()'s IS_ENABLED test exactly.
+            // With fault timeouts disabled the C inline is a constant false;
+            // when enabled, retain its queue-flag check and injection helper.
+            #[cfg(CONFIG_FAIL_IO_TIMEOUT)]
+            let fake_timeout = bindings::blk_should_fake_timeout((*request).q);
+            #[cfg(not(CONFIG_FAIL_IO_TIMEOUT))]
+            let fake_timeout = false;
+
+            fake_timeout || bindings::blk_mq_complete_request_remote(request)
                 || bindings::blk_mq_add_to_batch(
                     request,
                     batch,

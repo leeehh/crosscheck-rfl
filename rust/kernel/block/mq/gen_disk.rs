@@ -22,6 +22,7 @@ use crate::{
 /// Use this struct to configure and add new [`GenDisk`] to the VFS.
 pub struct GenDiskBuilder {
     rotational: bool,
+    write_cache: bool,
     logical_block_size: u32,
     physical_block_size: u32,
     capacity_sectors: u64,
@@ -38,6 +39,7 @@ impl Default for GenDiskBuilder {
     fn default() -> Self {
         Self {
             rotational: false,
+            write_cache: false,
             logical_block_size: bindings::PAGE_SIZE as u32,
             physical_block_size: bindings::PAGE_SIZE as u32,
             capacity_sectors: 0,
@@ -61,6 +63,14 @@ impl GenDiskBuilder {
     /// Set the rotational media attribute for the device to be built.
     pub fn rotational(mut self, rotational: bool) -> Self {
         self.rotational = rotational;
+        self
+    }
+
+    /// Publish whether writes may complete in a volatile device cache.
+    ///
+    /// Drivers enabling this limit must implement the corresponding cache flush operation.
+    pub fn write_cache(mut self, write_cache: bool) -> Self {
+        self.write_cache = write_cache;
         self
     }
 
@@ -172,7 +182,10 @@ impl GenDiskBuilder {
         lim.logical_block_size = self.logical_block_size;
         lim.physical_block_size = self.physical_block_size;
         if self.rotational {
-            lim.features = bindings::BLK_FEAT_ROTATIONAL;
+            lim.features |= bindings::BLK_FEAT_ROTATIONAL;
+        }
+        if self.write_cache {
+            lim.features |= bindings::BLK_FEAT_WRITE_CACHE;
         }
         if self.max_segments != 0 {
             lim.max_segments = self.max_segments as u16;

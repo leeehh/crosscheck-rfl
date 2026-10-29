@@ -40,7 +40,7 @@ pub use self::id::{
     ClassMask,
     Vendor, //
 };
-pub use self::io::{Bar, MemoryRegions, P2pAllocation, RemappableBar};
+pub use self::io::{Bar, BarWrite32Lease, MemoryRegions, P2pAllocation, RemappableBar};
 pub use self::irq::{
     AffinityCalculator,
     AffinitySetSizes,

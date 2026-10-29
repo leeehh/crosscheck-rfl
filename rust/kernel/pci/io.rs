@@ -12,7 +12,8 @@ use crate::{
         IoRaw, //
     },
     prelude::*,
-    sync::{aref::ARef, SpinLockIrqSave},
+    revocable::Revocable,
+    sync::{aref::ARef, Arc, Mutex, SpinLockIrqSave},
 };
 use core::{mem, ops::Deref, ptr::NonNull};
 use pin_init::{pin_data, PinInit};
@@ -178,22 +179,119 @@ impl Drop for RawBarMapping {
     }
 }
 
+/// A non-owning MMIO view. The mapping owner revokes every copy before
+/// dropping its underlying ioremap, and every access holds an RCU guard.
+struct BarLeaseView {
+    io: IoRaw,
+}
+
+impl BarLeaseView {
+    fn io(&self) -> &Io {
+        // SAFETY: The only caller holds this view's Revocable read guard.
+        // LeaseableBarMapping::drop waits for all such guards before iounmap.
+        unsafe { Io::from_raw(&self.io) }
+    }
+}
+
+/// One revocable, bounds-checked 32-bit register within a remappable BAR.
+///
+/// The handle can be retained across interrupts and shared across CPUs. It
+/// does not retain access after revocation: reads of a revoked generation
+/// fail with ENODEV. Acquiring a new handle is a cold setup operation; each
+/// write only enters an RCU read-side section and performs the MMIO access.
+/// Callers still serialize accesses to the hardware register as required by
+/// their device protocol. This handle does not provide a register lock.
+pub struct BarWrite32Lease {
+    view: Arc<Revocable<BarLeaseView>>,
+    offset: usize,
+}
+
+impl BarWrite32Lease {
+    /// Write a little-endian register, or fail if the mapping was revoked.
+    #[inline]
+    pub fn write(&self, value: u32) -> Result {
+        let view = self.view.try_access().ok_or(ENODEV)?;
+        view.io().try_write32(value, self.offset)
+    }
+}
+
+/// The sole ioremap owner paired with a revocable non-owning fast view.
+///
+/// Drop may sleep, like the underlying iounmap. The view is always revoked
+/// and all concurrent RCU readers drained before the raw mapping is dropped.
+struct LeaseableBarMapping {
+    raw: RawBarMapping,
+    view: Arc<Revocable<BarLeaseView>>,
+}
+
+impl LeaseableBarMapping {
+    fn make_view(raw: &RawBarMapping, flags: crate::alloc::Flags)
+        -> Result<Arc<Revocable<BarLeaseView>>>
+    {
+        let view = BarLeaseView {
+            io: IoRaw::new(raw.io.addr(), raw.io.maxsize())?,
+        };
+        Arc::pin_init(Revocable::new(Ok::<_, Error>(view)), flags)
+    }
+
+    fn map(start: bindings::resource_size_t, resource_len: usize, size: usize) -> Result<Self> {
+        let raw = RawBarMapping::map(start, resource_len, size)?;
+        let view = Self::make_view(&raw, GFP_KERNEL)?;
+        Ok(Self { raw, view })
+    }
+
+    fn io(&self) -> &Io {
+        self.raw.io()
+    }
+
+    fn lease_write32(&mut self, offset: usize) -> Result<BarWrite32Lease> {
+        if offset % core::mem::align_of::<u32>() != 0
+            || offset.checked_add(core::mem::size_of::<u32>()).ok_or(EINVAL)? > self.raw.io.maxsize()
+        {
+            return Err(EINVAL);
+        }
+        if self.view.try_access().is_none() {
+            // Called only during transport setup with the mapping lock held.
+            // A reset can revoke I/O leases while retaining the admin mapping.
+            // GFP_ATOMIC ensures that renewing this tiny view never sleeps
+            // under the irq-save lock. Allocation failure remains explicit.
+            self.view = Self::make_view(&self.raw, GFP_ATOMIC)?;
+        }
+        Ok(BarWrite32Lease { view: self.view.clone(), offset })
+    }
+}
+
+impl Drop for LeaseableBarMapping {
+    fn drop(&mut self) {
+        // Drop runs outside the mapping lock. No view can reach `raw` after
+        // revoke returns, even when callers retained leases across a remap.
+        self.view.revoke();
+    }
+}
+
 /// A BAR prefix whose `ioremap` can be safely replaced while interrupts are
 /// quiesced.
 ///
-/// Every MMIO access briefly holds an irq-save spinlock. A remap allocates the
-/// new mapping before taking that lock, swaps mappings under the lock, and
-/// unmaps the old range afterwards. Consequently interrupt-context users can
-/// never observe an unmapped pointer, a hard IRQ cannot re-enter an access on
-/// the same CPU, and the potentially sleeping `ioremap`/`iounmap` operations
-/// never execute while the spinlock is held.
+/// Management MMIO accesses briefly hold an irq-save spinlock. Queue hot
+/// paths may acquire a revocable register lease during setup and use RCU
+/// read-side protection instead. A remap allocates the new mapping before
+/// taking the lock, swaps mappings under it, then revokes old leases and waits
+/// for readers before unmapping outside the lock. All mapping destruction,
+/// including final Drop, must run in sleepable context. Lease acquisition,
+/// remap, revocation and device power transitions must be serialized by the
+/// transport's lifecycle lock.
 #[pin_data]
 pub struct RemappableBar {
     _pdev: ARef<Device>,
     resource_start: bindings::resource_size_t,
     resource_len: usize,
+    // Serialize complete cold transitions, including the RCU grace period.
+    // Revocable::revoke returns immediately to a second revoker, so merely
+    // serializing the pointer swap would not protect concurrent unmap.
     #[pin]
-    mapping: SpinLockIrqSave<Option<RawBarMapping>>,
+    lease_lifecycle: Mutex<()>,
+    #[pin]
+    mapping: SpinLockIrqSave<Option<LeaseableBarMapping>>,
 }
 
 impl RemappableBar {
@@ -207,7 +305,8 @@ impl RemappableBar {
             _pdev: pdev.into(),
             resource_start: pdev.resource_start(bar_index)?,
             resource_len: usize::try_from(pdev.resource_len(bar_index)?)?,
-            mapping <- crate::new_spinlock_irqsave!(Some(RawBarMapping::map(
+            lease_lifecycle <- crate::new_mutex!(()),
+            mapping <- crate::new_spinlock_irqsave!(Some(LeaseableBarMapping::map(
                 pdev.resource_start(bar_index)?,
                 usize::try_from(pdev.resource_len(bar_index)?)?,
                 size,
@@ -220,7 +319,8 @@ impl RemappableBar {
     /// The transport must first stop hardware users whose multi-register
     /// transactions require stronger serialization than an individual access.
     pub fn remap(&self, size: usize) -> Result {
-        let next = RawBarMapping::map(self.resource_start, self.resource_len, size)?;
+        let _lifecycle = self.lease_lifecycle.lock();
+        let next = LeaseableBarMapping::map(self.resource_start, self.resource_len, size)?;
         let previous = {
             let mut mapping = self.mapping.lock();
             mem::replace(&mut *mapping, Some(next))
@@ -231,11 +331,39 @@ impl RemappableBar {
 
     /// Unmap the BAR prefix. Further accesses fail with [`ENODEV`].
     pub fn unmap(&self) {
+        let _lifecycle = self.lease_lifecycle.lock();
         let previous = {
             let mut mapping = self.mapping.lock();
             mapping.take()
         };
         drop(previous);
+    }
+
+    /// Acquire a queue-local fast handle to one 32-bit register.
+    ///
+    /// This is a cold setup operation. The transport must serialize it with
+    /// remap, revocation and PCI power transitions. An earlier revoked lease
+    /// stays revoked; acquiring a new one starts a new view generation.
+    pub fn lease_write32(&self, offset: usize) -> Result<BarWrite32Lease> {
+        let _lifecycle = self.lease_lifecycle.lock();
+        let mut mapping = self.mapping.lock();
+        Option::as_mut(&mut *mapping)
+            .ok_or(ENODEV)?
+            .lease_write32(offset)
+    }
+
+    /// Revoke all currently issued queue leases without unmapping admin MMIO.
+    ///
+    /// Quiesce queue users and serialize lifecycle operations first. This may
+    /// sleep while waiting for in-flight MMIO readers; no spinlock is held
+    /// during that wait. Existing leases subsequently return ENODEV. A later
+    /// queue setup may acquire leases for a fresh generation on this mapping.
+    pub fn revoke_leases(&self) {
+        let _lifecycle = self.lease_lifecycle.lock();
+        let view = self.mapping.lock().as_ref().map(|mapping| mapping.view.clone());
+        if let Some(view) = view {
+            view.revoke();
+        }
     }
 
     /// Full BAR resource length, independent of the current mapped prefix.
@@ -248,7 +376,7 @@ impl RemappableBar {
         self.mapping
             .lock()
             .as_ref()
-            .map(|mapping| mapping.io.maxsize())
+            .map(|mapping| mapping.raw.io.maxsize())
             .unwrap_or(0)
     }
 

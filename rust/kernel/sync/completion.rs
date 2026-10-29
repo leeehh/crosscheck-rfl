@@ -114,6 +114,7 @@ impl Completion {
     /// This method wakes up at most one task waiting on this completion; unlike
     /// [`Completion::complete_all`], the completion is not permanently done and may be reused after
     /// a call to [`Completion::reinit`].
+    #[inline(always)]
     pub fn complete(&self) {
         // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
         unsafe { bindings::complete(self.as_raw()) };
@@ -135,6 +136,7 @@ impl Completion {
     /// Mirrors C's `wait_for_completion_killable()`. Blocks until the completion is signalled (by
     /// [`Completion::complete`] or [`Completion::complete_all`]) or a fatal signal is received.
     /// Returns `Ok(0)` on completion; `Err(ERESTARTSYS)` if interrupted.
+    #[inline(always)]
     pub fn wait_for_completion_killable(&self) -> Result {
         // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
         to_result(unsafe { bindings::wait_for_completion_killable(self.as_raw()) })
@@ -166,6 +168,7 @@ impl Completion {
     /// subsequent [`Completion::wait_for_completion_killable`] blocks until the next
     /// [`Completion::complete`]. Required when a completion is reused across requests (e.g. a
     /// virtqueue request/response cycle), since [`Completion::complete`] only releases one waiter.
+    #[inline(always)]
     pub fn reinit(&self) {
         // Mirrors C's `reinit_completion()`, which is `x->done = 0` (a plain write; the wait queue
         // is untouched). Done as a direct field write so the driver `.ko` needs no extra helper

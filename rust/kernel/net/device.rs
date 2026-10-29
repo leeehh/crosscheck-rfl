@@ -2336,6 +2336,197 @@ impl NapiContext<'_> {
         })
     }
 
+    /// Deliver one completed virtio receive owner directly to NAPI.
+    ///
+    /// The common single-buffer path materializes page metadata in fixed stack storage. Larger
+    /// chains retain the general owned-frame path.
+    pub fn receive_virtio_page_buffer<T: Operations>(
+        &self,
+        device: &Device<T>,
+        buffer: KBox<crate::virtio::RxPageBuffer>,
+        options: VirtioRxOptions,
+    ) -> Result {
+        const STACK_FRAGMENTS: usize = MAX_SKB_FRAGS as usize + 1;
+
+        if buffer.completed_len()? < options.header_len as usize + bindings::ETH_HLEN as usize {
+            return Err(EINVAL);
+        }
+        if buffer.mapping_count() > STACK_FRAGMENTS {
+            let frame = crate::virtio::RxPageBuffer::into_frame(buffer, GFP_ATOMIC)?;
+            return self.receive_virtio_pages(device, frame, options);
+        }
+
+        self.receive_virtio_page_buffer_borrowed(device, &buffer, options)
+    }
+
+    /// Deliver a completed virtio receive owner while retaining its token allocation for reuse.
+    ///
+    /// This is the allocation-free counterpart of [`Self::receive_virtio_page_buffer`] for a
+    /// descriptor chain that fits the fixed metadata stack. The synchronous helper takes its own
+    /// page references before return, so the caller may renew and resubmit the owner afterwards.
+    pub fn receive_reusable_virtio_page_buffer<T: Operations>(
+        &self,
+        device: &Device<T>,
+        buffer: &crate::virtio::RxPageBuffer,
+        options: VirtioRxOptions,
+    ) -> Result {
+        const STACK_FRAGMENTS: usize = MAX_SKB_FRAGS as usize + 1;
+
+        if buffer.mapping_count() > STACK_FRAGMENTS {
+            return Err(E2BIG);
+        }
+        self.receive_virtio_page_buffer_borrowed(device, buffer, options)
+    }
+
+    /// Deliver a mergeable frame while retaining its receive-owner allocations for reuse.
+    ///
+    /// Each borrowed owner must contain one completed page range. Up to 32 owners are accepted;
+    /// larger chains or multi-page owners return `E2BIG` before any packet is delivered. The
+    /// metadata stays on the stack, avoiding per-fragment frame allocations and metadata vectors.
+    /// The synchronous helper takes its own references for every page attached to an skb, so the
+    /// caller may renew the owners after return without modifying pages retained by the stack.
+    pub fn receive_reusable_virtio_page_buffers<'a, T: Operations>(
+        &self,
+        device: &Device<T>,
+        buffers: impl IntoIterator<Item = &'a crate::virtio::RxPageBuffer>,
+        options: VirtioRxOptions,
+    ) -> Result {
+        const STACK_FRAGMENTS: usize = 32;
+
+        let mut pages = [mem::MaybeUninit::<*mut bindings::page>::uninit(); STACK_FRAGMENTS];
+        let mut offsets = [mem::MaybeUninit::<u32>::uninit(); STACK_FRAGMENTS];
+        let mut lengths = [mem::MaybeUninit::<u32>::uninit(); STACK_FRAGMENTS];
+        let mut truesizes = [mem::MaybeUninit::<u32>::uninit(); STACK_FRAGMENTS];
+        let mut count = 0usize;
+        for buffer in buffers {
+            if count == STACK_FRAGMENTS {
+                return Err(E2BIG);
+            }
+            let (page, offset, length, truesize) = buffer.single_completed_range()?;
+            pages[count].write(page);
+            offsets[count].write(offset);
+            lengths[count].write(length);
+            truesizes[count].write(truesize);
+            count += 1;
+        }
+        if count == 0 {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: Each of the first `count` entries is initialized from a completed,
+        // CPU-synchronized range whose owner remains borrowed for this synchronous call. The
+        // helper validates the header and all ranges and takes separate page references before
+        // transferring them to an skb. Failure frees any skb/page references it acquired.
+        to_result(unsafe {
+            bindings::napi_receive_virtio_pages(
+                self.raw.as_ptr(),
+                device.as_raw(),
+                pages.as_ptr().cast(),
+                offsets.as_ptr().cast(),
+                lengths.as_ptr().cast(),
+                truesizes.as_ptr().cast(),
+                count as u32,
+                options.header_len,
+                options.little_endian,
+                options.hash_report,
+                options.tunnel_header_negotiated,
+                options.tunnel_checksum_negotiated,
+                options.queue_index,
+            )
+        })
+    }
+
+    /// Result of delivering one completed single-page virtio receive buffer.
+    ///
+    /// A mergeable header may report that subsequent virtqueue buffers belong to the same frame;
+    /// in that case no packet has been delivered yet and the caller retains the first owner.
+    #[inline]
+    pub fn receive_virtio_single_page<T: Operations>(
+        &self,
+        device: &Device<T>,
+        buffer: &crate::virtio::RxPageBuffer,
+        mergeable: bool,
+        options: VirtioRxOptions,
+    ) -> Result<Option<u16>> {
+        let (page, offset, length, truesize) = buffer.single_completed_range()?;
+        // SAFETY: `buffer` owns this completed, CPU-synchronized page range for the complete
+        // synchronous call. The helper takes a page reference before transferring a fragment to
+        // the skb. A positive return is a mergeable-buffer count and means no delivery occurred.
+        let result = unsafe {
+            bindings::napi_receive_virtio_single_page(
+                self.raw.as_ptr(),
+                device.as_raw(),
+                page,
+                offset,
+                length,
+                truesize,
+                options.header_len,
+                options.little_endian,
+                mergeable,
+                options.hash_report,
+                options.tunnel_header_negotiated,
+                options.tunnel_checksum_negotiated,
+                options.queue_index,
+            )
+        };
+        if result < 0 {
+            return Err(Error::from_errno(result));
+        }
+        if result == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(u16::try_from(result).map_err(|_| EOVERFLOW)?))
+        }
+    }
+
+    fn receive_virtio_page_buffer_borrowed<T: Operations>(
+        &self,
+        device: &Device<T>,
+        buffer: &crate::virtio::RxPageBuffer,
+        options: VirtioRxOptions,
+    ) -> Result {
+        const STACK_FRAGMENTS: usize = MAX_SKB_FRAGS as usize + 1;
+
+        if buffer.completed_len()? < options.header_len as usize + bindings::ETH_HLEN as usize {
+            return Err(EINVAL);
+        }
+
+        let mut pages = [mem::MaybeUninit::<*mut bindings::page>::uninit(); STACK_FRAGMENTS];
+        let mut offsets = [mem::MaybeUninit::<u32>::uninit(); STACK_FRAGMENTS];
+        let mut lengths = [mem::MaybeUninit::<u32>::uninit(); STACK_FRAGMENTS];
+        let mut truesizes = [mem::MaybeUninit::<u32>::uninit(); STACK_FRAGMENTS];
+        let mut index = 0usize;
+        let count = buffer.for_each_completed_range(|page, offset, length, truesize| {
+            pages[index].write(page);
+            offsets[index].write(offset);
+            lengths[index].write(length);
+            truesizes[index].write(truesize);
+            index += 1;
+        })?;
+        let count = u32::try_from(count).map_err(|_| EOVERFLOW)?;
+
+        // SAFETY: The first `count` entries of all four arrays were initialized from ranges owned
+        // by `buffer`. The helper takes any page references transferred to the skb before return,
+        // so the caller may drop or renew the original owner afterwards.
+        to_result(unsafe {
+            bindings::napi_receive_virtio_pages(
+                self.raw.as_ptr(),
+                device.as_raw(),
+                pages.as_ptr().cast(),
+                offsets.as_ptr().cast(),
+                lengths.as_ptr().cast(),
+                truesizes.as_ptr().cast(),
+                count,
+                options.header_len,
+                options.little_endian,
+                options.hash_report,
+                options.tunnel_header_negotiated,
+                options.tunnel_checksum_negotiated,
+                options.queue_index,
+            )
+        })
+    }
+
     /// Run one completed page-backed virtio-net frame through a native XDP program.
     ///
     /// The helper copies an order-0 XDP head from the borrowed frame. Programs without fragment
@@ -3354,18 +3545,21 @@ impl<T: Operations> Device<T> {
     }
 
     /// Stop one allocated transmit subqueue selected by its networking index.
+    #[inline]
     pub fn stop_tx_queue(&self, index: u32) -> Result {
         // SAFETY: The helper validates `index` against the live allocated TX queue count.
         to_result(unsafe { bindings::netdev_tx_stop_queue(self.as_raw(), index) })
     }
 
     /// Wake one stopped allocated transmit subqueue selected by its networking index.
+    #[inline]
     pub fn wake_tx_queue(&self, index: u32) -> Result {
         // SAFETY: The helper validates `index` against the live real TX queue count.
         to_result(unsafe { bindings::netdev_tx_wake_queue(self.as_raw(), index) })
     }
 
     /// Whether one allocated transmit subqueue is currently stopped.
+    #[inline]
     pub fn tx_queue_stopped(&self, index: u32) -> Result<bool> {
         let mut stopped = false;
         // SAFETY: The helper validates `index`; `stopped` is writable for one bool.
@@ -3376,6 +3570,7 @@ impl<T: Operations> Device<T> {
     }
 
     /// Account one queued BQL packet and decide whether this batch should kick.
+    #[inline]
     pub fn tx_sent(&self, index: u32, bytes: u32, more: bool) -> Result<bool> {
         let mut kick = false;
         // SAFETY: The helper validates `index`; `kick` is writable for one bool.
@@ -3386,6 +3581,7 @@ impl<T: Operations> Device<T> {
     }
 
     /// Complete a BQL batch previously accounted by [`Self::tx_sent`].
+    #[inline]
     pub fn tx_completed(&self, index: u32, packets: u32, bytes: u32) -> Result {
         // SAFETY: The helper validates `index`; the counters are driver-owned batch totals.
         to_result(unsafe {
@@ -3481,24 +3677,28 @@ pub struct TxPacket(NonNull<bindings::sk_buff>);
 
 impl TxPacket {
     /// Packet length in bytes.
+    #[inline(always)]
     pub fn len(&self) -> u32 {
         // SAFETY: The type invariant guarantees a live skb.
         unsafe { (*self.0.as_ptr()).len }
     }
 
     /// Transmit queue selected by networking core.
+    #[inline]
     pub fn queue_mapping(&self) -> u16 {
         // SAFETY: The type invariant guarantees a live skb.
         unsafe { bindings::skb_get_queue_mapping(self.0.as_ptr()) }
     }
 
     /// Whether networking core has another packet ready for this CPU's transmit batch.
+    #[inline]
     pub fn xmit_more(&self) -> bool {
         // SAFETY: This is the inline networking-core query wrapped for Rust modules.
         unsafe { bindings::netdev_xmit_more() }
     }
 
     /// Record the requested software/hardware transmit timestamp before submission.
+    #[inline]
     pub fn timestamp(&mut self) {
         // SAFETY: This value exclusively owns the live skb.
         unsafe { bindings::skb_tx_timestamp(self.0.as_ptr()) };

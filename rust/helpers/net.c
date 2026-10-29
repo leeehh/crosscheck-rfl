@@ -650,10 +650,15 @@ int rust_helper_napi_receive_virtio_pages(struct napi_struct *napi,
 
 	rust_helper_copy_from_page(pages[0], offsets[0], &header, header_len);
 	payload_len = frame_len - header_len;
-	head_copy = min(payload_len, 128U);
-	skb = napi_alloc_skb(napi, head_copy);
+	skb = napi_alloc_skb(napi, 128U);
 	if (!skb)
 		return -ENOMEM;
+	/* Match virtio-net's page_to_skb() policy: copy a whole small frame,
+	 * but keep only the Ethernet header linear when a large frame will use
+	 * page fragments. Copying a fixed 128-byte prefix here adds needless
+	 * receive-side memory traffic for every full-sized packet.
+	 */
+	head_copy = payload_len <= skb_tailroom(skb) ? payload_len : ETH_HLEN;
 
 	/* Keep the Ethernet header and a small prefix linear. */
 	skip = header_len;
@@ -722,6 +727,80 @@ no_memory:
 invalid:
 	kfree_skb(skb);
 	return -EINVAL;
+}
+
+int rust_helper_napi_receive_virtio_single_page(struct napi_struct *napi,
+						 struct net_device *dev,
+						 struct page *page,
+						 u32 offset, u32 length,
+						 u32 truesize,
+						 unsigned int header_len,
+						 bool little_endian,
+						 bool mergeable,
+						 bool hash_report,
+						 bool tunnel_header_negotiated,
+						 bool tunnel_checksum_negotiated,
+						 unsigned int queue_index)
+{
+	struct virtio_net_hdr_v1_hash_tunnel header = {};
+	struct sk_buff *skb;
+	void *base;
+	u8 *buffer;
+	u16 buffers = 1;
+	unsigned int payload_len, head_copy, remaining;
+
+	if (!napi || !dev || !page || offset > PAGE_SIZE ||
+	    length > PAGE_SIZE - offset || truesize < length ||
+	    header_len < sizeof(struct virtio_net_hdr) ||
+	    header_len > sizeof(header) || length < header_len + ETH_HLEN ||
+	    (hash_report && header_len < sizeof(header.hash_hdr)) ||
+	    ((tunnel_header_negotiated || tunnel_checksum_negotiated) &&
+	     header_len < sizeof(header)))
+		return -EINVAL;
+
+	base = kmap_local_page(page);
+	buffer = base + offset;
+	memcpy(&header, buffer, header_len);
+	if (mergeable) {
+		__virtio16 encoded;
+
+		memcpy(&encoded,
+		       buffer + offsetof(struct virtio_net_hdr_mrg_rxbuf,
+					 num_buffers),
+		       sizeof(encoded));
+		buffers = little_endian ? le16_to_cpu((__force __le16)encoded) :
+					   be16_to_cpu((__force __be16)encoded);
+		if (!buffers) {
+			kunmap_local(base);
+			return -EINVAL;
+		}
+		if (buffers != 1) {
+			kunmap_local(base);
+			return buffers;
+		}
+	}
+
+	payload_len = length - header_len;
+	skb = napi_alloc_skb(napi, 128U);
+	if (!skb) {
+		kunmap_local(base);
+		return -ENOMEM;
+	}
+	head_copy = payload_len <= skb_tailroom(skb) ? payload_len : ETH_HLEN;
+	skb_put_data(skb, buffer + header_len, head_copy);
+	remaining = payload_len - head_copy;
+	if (remaining) {
+		get_page(page);
+		skb_add_rx_frag(skb, 0, page, offset + header_len + head_copy,
+				remaining, truesize);
+	}
+	kunmap_local(base);
+
+	return rust_helper_napi_receive_virtio_finish(napi, dev, skb, &header,
+						      little_endian, hash_report,
+						      tunnel_header_negotiated,
+						      tunnel_checksum_negotiated,
+						      queue_index);
 }
 
 struct xdp_rxq_info *rust_helper_xdp_rxq_info_create(void)

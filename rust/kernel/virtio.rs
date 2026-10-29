@@ -618,6 +618,29 @@ impl<Ctx: device::DeviceContext> Device<Ctx> {
     /// `virtio_find_single_vq(vdev, cb, name)`, but the callback is the Adapter's own trampoline
     /// (which dispatches to the safe trait method) — the driver passes only the vq name.
     pub fn find_single_vq<D: Driver>(&self, name: &CStr) -> Result<VirtQueue> {
+        self.find_single_vq_inner::<D>(name, None)
+    }
+
+    /// Find one callback-enabled virtqueue using the transport's default IRQ affinity policy.
+    ///
+    /// This passes a zero-initialized `struct irq_affinity`, matching C callers of
+    /// `virtio_find_vqs` that request automatic interrupt spreading without a custom callback.
+    /// The PCI transport reserves its configuration vector and requests managed affinity for
+    /// the queue when it can use a separate MSI-X vector. Other transports and interrupt
+    /// fallbacks retain their own policies. No CPU mask or queue count is selected here.
+    pub fn find_single_vq_with_default_affinity<D: Driver>(
+        &self,
+        name: &CStr,
+    ) -> Result<VirtQueue> {
+        let mut affinity = bindings::irq_affinity::default();
+        self.find_single_vq_inner::<D>(name, Some(&mut affinity))
+    }
+
+    fn find_single_vq_inner<D: Driver>(
+        &self,
+        name: &CStr,
+        affinity: Option<&mut bindings::irq_affinity>,
+    ) -> Result<VirtQueue> {
         let mut info = bindings::virtqueue_info {
             name: name.as_char_ptr(),
             callback: Some(Adapter::<D>::vq_callback),
@@ -625,13 +648,15 @@ impl<Ctx: device::DeviceContext> Device<Ctx> {
         };
         let mut vq: *mut bindings::virtqueue = core::ptr::null_mut();
 
+        let affinity = affinity.map_or(core::ptr::null_mut(), |value| value as *mut _);
         // SAFETY: `self.as_raw()` is a valid `struct virtio_device`; `config` is installed by the
-        // transport. `info` describes one vq; `vq` receives the created virtqueue.
+        // transport. `info` describes one vq; `vq` receives the created virtqueue. The optional
+        // affinity descriptor is exclusively borrowed for this synchronous call. As with C's
+        // stack-allocated descriptors, the transport may update it but does not retain its
+        // pointer. It contains no Rust callback or private-data pointer.
         let config = unsafe { (*self.as_raw()).config };
         let find_vqs = unsafe { (*config).find_vqs.ok_or(EINVAL)? };
-        to_result(unsafe {
-            find_vqs(self.as_raw(), 1, &mut vq, &mut info, core::ptr::null_mut())
-        })?;
+        to_result(unsafe { find_vqs(self.as_raw(), 1, &mut vq, &mut info, affinity) })?;
 
         VirtQueue::new(vq)
     }
@@ -1902,6 +1927,51 @@ impl RxPageMapping {
     }
 }
 
+/// Inline storage for the overwhelmingly common one-mapping receive buffer.
+///
+/// Multi-page drivers retain the dynamically sized representation, while small and mergeable
+/// virtio-net buffers avoid allocating a one-element vector for every descriptor.
+enum RxPageMappings {
+    Inline(Option<RxPageMapping>),
+    Dynamic(KVec<RxPageMapping>),
+}
+
+impl RxPageMappings {
+    fn with_capacity(count: usize, flags: alloc::Flags) -> Result<Self> {
+        if count == 1 {
+            Ok(Self::Inline(None))
+        } else {
+            Ok(Self::Dynamic(KVec::with_capacity(count, flags)?))
+        }
+    }
+
+    fn push(&mut self, mapping: RxPageMapping, flags: alloc::Flags) -> Result {
+        match self {
+            Self::Inline(slot) if slot.is_none() => {
+                *slot = Some(mapping);
+                Ok(())
+            }
+            Self::Inline(_) => Err(EOVERFLOW),
+            Self::Dynamic(mappings) => Ok(mappings.push(mapping, flags)?),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline(mapping) => usize::from(mapping.is_some()),
+            Self::Dynamic(mappings) => mappings.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<&RxPageMapping> {
+        match self {
+            Self::Inline(mapping) if index == 0 => mapping.as_ref(),
+            Self::Inline(_) => None,
+            Self::Dynamic(mappings) => mappings.get(index),
+        }
+    }
+}
+
 /// A completed receive frame backed by owned page references.
 ///
 /// The frame is no longer DMA mapped. It may be extended with subsequent mergeable-buffer
@@ -1991,7 +2061,7 @@ impl RxPageFrame {
 /// references and virtqueue tokens in one typed state machine.
 pub struct RxPageBuffer {
     queue: NonNull<bindings::virtqueue>,
-    pages: KVec<RxPageMapping>,
+    pages: RxPageMappings,
     length: usize,
     submitted: bool,
     completed_length: Option<usize>,
@@ -2058,12 +2128,10 @@ impl RxPageBuffer {
         flags: alloc::Flags,
     ) -> Result<KBox<Self>> {
         let slice = pool.allocate_fragment(length, headroom, tailroom, flags)?;
-        let mut pages = KVec::with_capacity(1, flags)?;
-        pages.push(RxPageMapping::Shared(slice), flags)?;
         Ok(KBox::new(
             Self {
                 queue: pool.queue,
-                pages,
+                pages: RxPageMappings::Inline(Some(RxPageMapping::Shared(slice))),
                 length,
                 submitted: false,
                 completed_length: None,
@@ -2071,6 +2139,31 @@ impl RxPageBuffer {
             },
             flags,
         )?)
+    }
+
+    /// Reuse a completed receive-owner allocation with a fresh shared-page fragment.
+    ///
+    /// Networking core may retain the old page after a synchronous receive helper takes its own
+    /// reference. Replacing the mapping releases this owner's old reference while retaining the
+    /// allocation that serves as the virtqueue token.
+    #[inline]
+    pub fn renew_fragment(
+        mut buffer: KBox<Self>,
+        pool: &Arc<RxPagePool>,
+        length: usize,
+        headroom: usize,
+        tailroom: usize,
+        flags: alloc::Flags,
+    ) -> Result<KBox<Self>> {
+        if buffer.queue != pool.queue || buffer.submitted || buffer.completed_length.is_none() {
+            return Err(EBUSY);
+        }
+        let slice = pool.allocate_fragment(length, headroom, tailroom, flags)?;
+        buffer.pages = RxPageMappings::Inline(Some(RxPageMapping::Shared(slice)));
+        buffer.length = length;
+        buffer.completed_length = None;
+        buffer.first_segment_length = None;
+        Ok(buffer)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2100,7 +2193,7 @@ impl RxPageBuffer {
             return Err(EINVAL);
         }
 
-        let mut pages = KVec::with_capacity(page_count, flags)?;
+        let mut pages = RxPageMappings::with_capacity(page_count, flags)?;
         let mut remaining = length;
         let mut offset = headroom;
         while remaining != 0 {
@@ -2174,7 +2267,7 @@ impl RxPageBuffer {
     /// Legacy virtio layouts use this to keep the device header in its own descriptor while the
     /// typed owner still manages one mapping and one page reference.
     pub fn split_first_segment(mut buffer: KBox<Self>, length: u32) -> Result<KBox<Self>> {
-        let first = buffer.pages.first().ok_or(EINVAL)?;
+        let first = buffer.pages.get(0).ok_or(EINVAL)?;
         if length == 0 || length >= first.length() || buffer.submitted {
             return Err(EINVAL);
         }
@@ -2194,7 +2287,8 @@ impl RxPageBuffer {
         }
         let mut logical = 0usize;
         let mut copied = 0usize;
-        for mapped in &self.pages {
+        for index in 0..self.pages.len() {
+            let mapped = self.pages.get(index).ok_or(EIO)?;
             let mapped_end = logical + mapped.length() as usize;
             if offset + copied >= mapped_end {
                 logical = mapped_end;
@@ -2222,6 +2316,63 @@ impl RxPageBuffer {
         Err(EIO)
     }
 
+    /// Number of bytes returned by the device for this completed buffer.
+    pub(crate) fn completed_len(&self) -> Result<usize> {
+        self.completed_length.ok_or(EBUSY)
+    }
+
+    /// Number of mappings that may contribute to the completed frame.
+    pub(crate) fn mapping_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Return the single non-empty range of a completed receive buffer.
+    pub(crate) fn single_completed_range(&self) -> Result<(*mut bindings::page, u32, u32, u32)> {
+        if self.pages.len() != 1 {
+            return Err(E2BIG);
+        }
+        let mapped = self.pages.get(0).ok_or(EIO)?;
+        let length = self.completed_len()?.min(mapped.length() as usize);
+        if length == 0 || length != self.completed_len()? {
+            return Err(EIO);
+        }
+        Ok((
+            mapped.page()?.as_ptr(),
+            mapped.offset(),
+            length as u32,
+            mapped.truesize(),
+        ))
+    }
+
+    /// Visit the non-empty page ranges returned by the device without allocating metadata arrays.
+    pub(crate) fn for_each_completed_range(
+        &self,
+        mut visit: impl FnMut(*mut bindings::page, u32, u32, u32),
+    ) -> Result<usize> {
+        let mut remaining = self.completed_len()?;
+        let mut count = 0usize;
+        for index in 0..self.pages.len() {
+            let mapped = self.pages.get(index).ok_or(EIO)?;
+            let length = remaining.min(mapped.length() as usize);
+            if length == 0 {
+                break;
+            }
+            visit(
+                mapped.page()?.as_ptr(),
+                mapped.offset(),
+                length as u32,
+                mapped.truesize(),
+            );
+            count += 1;
+            remaining -= length;
+        }
+        if remaining == 0 && count != 0 {
+            Ok(count)
+        } else {
+            Err(EIO)
+        }
+    }
+
     fn prepare_submission(&mut self, flags: alloc::Flags) -> Result<KVec<DmaSegment>> {
         if self.submitted {
             return Err(EBUSY);
@@ -2232,7 +2383,8 @@ impl RxPageBuffer {
             .checked_add(usize::from(self.first_segment_length.is_some()))
             .ok_or(EOVERFLOW)?;
         let mut segments = KVec::with_capacity(capacity, flags)?;
-        for (index, mapped) in self.pages.iter().enumerate() {
+        for index in 0..self.pages.len() {
+            let mapped = self.pages.get(index).ok_or(EIO)?;
             mapped.sync_for_device();
             if index == 0 {
                 if let Some(header) = self.first_segment_length {
@@ -2251,6 +2403,21 @@ impl RxPageBuffer {
         Ok(segments)
     }
 
+    fn prepare_single_submission(&mut self) -> Result<Option<DmaSegment>> {
+        if self.submitted {
+            return Err(EBUSY);
+        }
+        if self.pages.len() != 1 || self.first_segment_length.is_some() {
+            return Ok(None);
+        }
+        let mapped = self.pages.get(0).ok_or(EIO)?;
+        mapped.sync_for_device();
+        let segment = mapped.segment()?;
+        self.completed_length = None;
+        self.submitted = true;
+        Ok(Some(segment))
+    }
+
     fn finish_submission(&mut self, used_length: Option<u32>) -> Result {
         if !self.submitted {
             return Err(EINVAL);
@@ -2260,7 +2427,8 @@ impl RxPageBuffer {
             return Err(EIO);
         }
         let mut remaining = used;
-        for mapped in &self.pages {
+        for index in 0..self.pages.len() {
+            let mapped = self.pages.get(index).ok_or(EIO)?;
             let length = remaining.min(mapped.length() as usize);
             mapped.sync_for_cpu(length);
             remaining -= length;
@@ -2276,11 +2444,21 @@ impl RxPageBuffer {
         let used = buffer.completed_length.take().ok_or(EBUSY)?;
         let mut fragments = KVec::with_capacity(buffer.pages.len(), flags)?;
         let mut remaining = used;
-        for mapped in buffer.pages.drain_all() {
+        let mut append = |mapped: RxPageMapping| -> Result {
             let length = remaining.min(mapped.length() as usize);
             remaining -= length;
             if length != 0 {
                 fragments.push(mapped.into_fragment(length as u32)?, flags)?;
+            }
+            Ok(())
+        };
+        match buffer.pages {
+            RxPageMappings::Inline(Some(mapped)) => append(mapped)?,
+            RxPageMappings::Inline(None) => return Err(EIO),
+            RxPageMappings::Dynamic(mut mappings) => {
+                for mapped in mappings.drain_all() {
+                    append(mapped)?;
+                }
             }
         }
         if remaining != 0 {
@@ -2305,6 +2483,7 @@ pub struct CallbackPoll<'a> {
 
 impl CallbackPoll<'_> {
     /// Return whether the device used another buffer in the race window after callback re-enable.
+    #[inline(always)]
     pub fn poll(self) -> bool {
         // SAFETY: `opaque` came from `virtqueue_enable_cb_prepare` for this same live queue.
         unsafe { bindings::virtqueue_poll(self.queue.0.as_ptr(), self.opaque) }
@@ -2325,6 +2504,7 @@ pub struct NetTxOptions {
 
 impl NetTxOptions {
     /// Create options for a negotiated header size and virtio byte order.
+    #[inline]
     pub fn new(header_len: u32, little_endian: bool) -> Result<Self> {
         // The basic header is ten bytes and skb->cb is the separate-header upper bound.
         if !(10..=48).contains(&header_len) {
@@ -2342,30 +2522,35 @@ impl NetTxOptions {
     }
 
     /// Permit the zero-allocation headroom optimization when skb alignment and cloning allow it.
+    #[inline]
     pub fn allow_inline_header(mut self, allow: bool) -> Self {
         self.allow_inline_header = allow;
         self
     }
 
     /// Declare negotiated UDP tunnel-header support.
+    #[inline]
     pub fn tunnel_header(mut self, negotiated: bool) -> Self {
         self.tunnel_header_negotiated = negotiated;
         self
     }
 
     /// Set the outer VLAN header length used by checksum/GSO conversion.
+    #[inline]
     pub fn vlan_header_len(mut self, bytes: u16) -> Self {
         self.vlan_header_len = bytes;
         self
     }
 
     /// Permit `VIRTIO_NET_HDR_F_DATA_VALID` when the receiving contract supports it.
+    #[inline]
     pub fn data_valid(mut self, enabled: bool) -> Self {
         self.has_data_valid = enabled;
         self
     }
 
     /// Release socket and conntrack ownership only after queue submission succeeds.
+    #[inline]
     pub fn orphan_after_submit(mut self, enabled: bool) -> Self {
         self.orphan_after_submit = enabled;
         self
@@ -2505,6 +2690,7 @@ impl VirtQueue {
     /// Submit a single input buffer. Mirrors C's `virtqueue_add_inbuf(vq, &sg, 1, data, gfp)`. The
     /// `flags` (e.g. [`GFP_ATOMIC`] from an IRQ callback, [`GFP_KERNEL`] from process context) reach
     /// the virtqueue allocator verbatim.
+    #[inline]
     pub fn add_inbuf(
         &self,
         buf: *mut core::ffi::c_void,
@@ -2554,6 +2740,7 @@ impl VirtQueue {
     ///
     /// On failure the error retains the same packet; on success only
     /// [`Self::get_tx_packet`] or reset recycling can restore ownership.
+    #[inline]
     pub fn add_tx_packet(
         &self,
         mut packet: TxPacket,
@@ -2749,6 +2936,7 @@ impl VirtQueue {
     /// Transfer an owned page-backed receive allocation to one premapped input descriptor chain.
     /// On failure the mappings and page references are reclaimed and dropped; on success the
     /// queue owns them until completion or synchronous recycling.
+    #[inline]
     pub fn add_rx_page_buffer(
         &self,
         mut buffer: KBox<RxPageBuffer>,
@@ -2757,6 +2945,18 @@ impl VirtQueue {
     ) -> Result {
         if buffer.queue != self.0 {
             return Err(EINVAL);
+        }
+        if let Some(segment) = buffer.prepare_single_submission()? {
+            let mut sg = PremappedSg::new([segment])?;
+            let raw = KBox::into_raw(buffer);
+            match self.add_inbuf_premapped(&mut sg, raw.cast(), context, flags) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    // SAFETY: Submission failed, so the queue did not take ownership of `raw`.
+                    drop(unsafe { KBox::<RxPageBuffer>::from_raw(raw) });
+                    return Err(error);
+                }
+            }
         }
         let segments = buffer.prepare_submission(flags)?;
         let mut sg = PremappedSgDyn::new(&segments, flags)?;
@@ -2974,6 +3174,7 @@ impl VirtQueue {
     }
 
     /// Retrieve a completed buffer. Mirrors C's `virtqueue_get_buf(vq, &len)`.
+    #[inline(always)]
     pub fn get_buf(&self) -> Option<(*mut core::ffi::c_void, u32)> {
         let mut len: core::ffi::c_uint = 0;
         // SAFETY: `self.0` is a valid virtqueue.
@@ -3015,6 +3216,7 @@ impl VirtQueue {
         }
     }
 
+    #[inline]
     fn restore_net_tx(token: *mut c_void) -> Result<NetTxCompletion> {
         let address = token as usize;
         match address & Self::NET_TX_TOKEN_MASK {
@@ -3048,6 +3250,7 @@ impl VirtQueue {
     }
 
     /// Retrieve one typed skb/XDP/AF_XDP completion from a shared virtio-net TX queue.
+    #[inline]
     pub fn get_net_tx_completion(&self) -> Result<Option<(NetTxCompletion, u32)>> {
         let Some((token, length)) = self.get_buf() else {
             return Ok(None);
@@ -3099,6 +3302,7 @@ impl VirtQueue {
     }
 
     /// Retrieve a completed page-backed receive allocation and restore its unique ownership.
+    #[inline]
     pub fn get_rx_page_buffer_ctx(&self) -> Result<Option<(KBox<RxPageBuffer>, u32, *mut c_void)>> {
         let Some((token, length, context)) = self.get_buf_ctx() else {
             return Ok(None);
@@ -3135,6 +3339,7 @@ impl VirtQueue {
     }
 
     /// Notify the device that buffers are available. Mirrors C's `virtqueue_kick(vq)`.
+    #[inline(always)]
     pub fn kick(&self) -> bool {
         // SAFETY: `self.0` is a valid virtqueue.
         unsafe { bindings::virtqueue_kick(self.0.as_ptr()) }
@@ -3154,6 +3359,7 @@ impl VirtQueue {
 
     /// Number of currently free descriptors. Driver-side queue serialization
     /// must cover this snapshot and the following submission decision.
+    #[inline(always)]
     pub fn num_free(&self) -> u32 {
         // SAFETY: `self.0` is a live virtqueue and the driver serializes ring mutation.
         unsafe { (*self.0.as_ptr()).num_free }
@@ -3161,18 +3367,21 @@ impl VirtQueue {
 
     /// Prepare a kick (expose buffers to the device) without notifying. Mirrors C's
     /// `virtqueue_kick_prepare(vq)`; pair with [`VirtQueue::notify`] to batch notifications.
+    #[inline(always)]
     pub fn kick_prepare(&self) -> bool {
         // SAFETY: `self.0` is a valid virtqueue.
         unsafe { bindings::virtqueue_kick_prepare(self.0.as_ptr()) }
     }
 
     /// Notify the device (the second half of a batched kick). Mirrors C's `virtqueue_notify(vq)`.
+    #[inline(always)]
     pub fn notify(&self) -> bool {
         // SAFETY: `self.0` is a valid virtqueue.
         unsafe { bindings::virtqueue_notify(self.0.as_ptr()) }
     }
 
     /// Disable callbacks on this virtqueue. Mirrors C's `virtqueue_disable_cb(vq)`.
+    #[inline(always)]
     pub fn disable_cb(&self) {
         // SAFETY: `self.0` is a valid virtqueue.
         unsafe { bindings::virtqueue_disable_cb(self.0.as_ptr()) };
@@ -3180,6 +3389,7 @@ impl VirtQueue {
 
     /// Re-enable callbacks; returns `false` if more buffers are pending. Mirrors C's
     /// `virtqueue_enable_cb(vq)`.
+    #[inline(always)]
     pub fn enable_cb(&self) -> bool {
         // SAFETY: `self.0` is a valid virtqueue.
         unsafe { bindings::virtqueue_enable_cb(self.0.as_ptr()) }
@@ -3187,6 +3397,7 @@ impl VirtQueue {
 
     /// Re-enable callbacks while capturing the opaque queue state needed to close the NAPI
     /// completion race. Consume the returned token with [`CallbackPoll::poll`].
+    #[inline(always)]
     pub fn enable_cb_prepare(&self) -> CallbackPoll<'_> {
         // SAFETY: `self.0` is a valid virtqueue.
         let opaque = unsafe { bindings::virtqueue_enable_cb_prepare(self.0.as_ptr()) };
@@ -3198,6 +3409,7 @@ impl VirtQueue {
 
     /// Re-enable callbacks with the virtio delayed-event threshold. Returns `false` when work is
     /// already pending and the caller must schedule/drain the queue again.
+    #[inline(always)]
     pub fn enable_cb_delayed(&self) -> bool {
         // SAFETY: `self.0` is a valid virtqueue.
         unsafe { bindings::virtqueue_enable_cb_delayed(self.0.as_ptr()) }

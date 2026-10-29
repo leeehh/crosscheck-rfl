@@ -111,18 +111,21 @@ unsafe impl super::Backend for SpinLockBackend {
         unsafe { bindings::__spin_lock_init(ptr, name, key) }
     }
 
+    #[inline(always)]
     unsafe fn lock(ptr: *mut Self::State) -> Self::GuardState {
         // SAFETY: The safety requirements of this function ensure that `ptr` points to valid
         // memory, and that it has been initialised before.
         unsafe { bindings::spin_lock(ptr) }
     }
 
+    #[inline(always)]
     unsafe fn unlock(ptr: *mut Self::State, _guard_state: &Self::GuardState) {
         // SAFETY: The safety requirements of this function ensure that `ptr` is valid and that the
         // caller is the owner of the spinlock.
         unsafe { bindings::spin_unlock(ptr) }
     }
 
+    #[inline(always)]
     unsafe fn try_lock(ptr: *mut Self::State) -> Option<Self::GuardState> {
         // SAFETY: The `ptr` pointer is guaranteed to be valid and initialized before use.
         let result = unsafe { bindings::spin_trylock(ptr) };
@@ -134,9 +137,15 @@ unsafe impl super::Backend for SpinLockBackend {
         }
     }
 
+    #[inline(always)]
     unsafe fn assert_is_held(ptr: *mut Self::State) {
+        // Match lockdep_assert_held(): without CONFIG_LOCKDEP the C helper
+        // is empty, so no cross-language call is needed to perform the check.
+        #[cfg(CONFIG_LOCKDEP)]
         // SAFETY: The `ptr` pointer is guaranteed to be valid and initialized before use.
-        unsafe { bindings::spin_assert_is_held(ptr) }
+        unsafe { bindings::spin_assert_is_held(ptr) };
+        #[cfg(not(CONFIG_LOCKDEP))]
+        let _ = ptr;
     }
 }
 
@@ -180,17 +189,20 @@ unsafe impl super::Backend for SpinLockIrqSaveBackend {
         unsafe { bindings::__spin_lock_init(ptr, name, key) }
     }
 
+    #[inline(always)]
     unsafe fn lock(ptr: *mut Self::State) -> Self::GuardState {
         // SAFETY: The safety requirements of this function ensure that `ptr` points to valid,
         // initialized memory.
         unsafe { bindings::spin_lock_irqsave(ptr) }
     }
 
+    #[inline(always)]
     unsafe fn unlock(ptr: *mut Self::State, guard_state: &Self::GuardState) {
         // SAFETY: The safety requirements ensure `ptr` is valid and the caller owns the lock.
         unsafe { bindings::spin_unlock_irqrestore(ptr, *guard_state) }
     }
 
+    #[inline(always)]
     unsafe fn try_lock(ptr: *mut Self::State) -> Option<Self::GuardState> {
         // SAFETY: The `ptr` pointer is guaranteed to be valid and initialized before use.
         let mut flags: crate::ffi::c_ulong = 0;
@@ -202,8 +214,14 @@ unsafe impl super::Backend for SpinLockIrqSaveBackend {
         }
     }
 
+    #[inline(always)]
     unsafe fn assert_is_held(ptr: *mut Self::State) {
+        // Match lockdep_assert_held(): without CONFIG_LOCKDEP the C helper
+        // is empty, so no cross-language call is needed to perform the check.
+        #[cfg(CONFIG_LOCKDEP)]
         // SAFETY: The `ptr` pointer is guaranteed to be valid and initialized before use.
-        unsafe { bindings::spin_assert_is_held(ptr) }
+        unsafe { bindings::spin_assert_is_held(ptr) };
+        #[cfg(not(CONFIG_LOCKDEP))]
+        let _ = ptr;
     }
 }
