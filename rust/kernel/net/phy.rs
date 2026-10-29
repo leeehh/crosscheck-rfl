@@ -10,6 +10,7 @@ use crate::{device_id::RawDeviceId, error::*, prelude::*, types::Opaque};
 use core::{marker::PhantomData, ptr::addr_of_mut};
 
 pub mod reg;
+pub use crate::irq::IrqReturn;
 
 /// PHY state machine states.
 ///
@@ -48,6 +49,30 @@ pub enum DuplexMode {
     Half,
     /// PHY is in unknown duplex mode.
     Unknown,
+}
+
+/// A PHY interface mode.
+#[derive(PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InterfaceMode {
+    /// Media-independent interface.
+    Mii,
+    /// Reduced media-independent interface.
+    Rmii,
+    /// Another interface mode not yet modeled by this abstraction.
+    Other,
+}
+
+/// A PHY connector port.
+#[derive(PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Port {
+    /// MII port.
+    Mii,
+    /// Fibre port.
+    Fibre,
+    /// Another port type not yet modeled by this abstraction.
+    Other,
 }
 
 /// An instance of a PHY device.
@@ -124,38 +149,82 @@ impl Device {
     ///
     /// It returns true if the link is up.
     pub fn is_link_up(&self) -> bool {
-        const LINK_IS_UP: u64 = 1;
-        // TODO: the code to access to the bit field will be replaced with automatically
-        // generated code by bindgen when it becomes possible.
+        const LINK_IS_UP: c_uint = 1;
         // SAFETY: The struct invariant ensures that we may access
         // this field without additional synchronization.
-        let bit_field = unsafe { &(*self.0.get())._bitfield_1 };
-        bit_field.get(14, 1) == LINK_IS_UP
+        unsafe { (*self.0.get()).link() == LINK_IS_UP }
     }
 
     /// Gets the current auto-negotiation configuration.
     ///
     /// It returns true if auto-negotiation is enabled.
     pub fn is_autoneg_enabled(&self) -> bool {
-        // TODO: the code to access to the bit field will be replaced with automatically
-        // generated code by bindgen when it becomes possible.
         // SAFETY: The struct invariant ensures that we may access
         // this field without additional synchronization.
-        let bit_field = unsafe { &(*self.0.get())._bitfield_1 };
-        bit_field.get(13, 1) == u64::from(bindings::AUTONEG_ENABLE)
+        unsafe { (*self.0.get()).autoneg() == bindings::AUTONEG_ENABLE }
     }
 
     /// Gets the current auto-negotiation state.
     ///
     /// It returns true if auto-negotiation is completed.
     pub fn is_autoneg_completed(&self) -> bool {
-        const AUTONEG_COMPLETED: u64 = 1;
-        // TODO: the code to access to the bit field will be replaced with automatically
-        // generated code by bindgen when it becomes possible.
+        const AUTONEG_COMPLETED: c_uint = 1;
         // SAFETY: The struct invariant ensures that we may access
         // this field without additional synchronization.
-        let bit_field = unsafe { &(*self.0.get())._bitfield_1 };
-        bit_field.get(15, 1) == AUTONEG_COMPLETED
+        unsafe { (*self.0.get()).autoneg_complete() == AUTONEG_COMPLETED }
+    }
+
+    /// Returns true when PHY interrupts are enabled.
+    pub fn interrupts_enabled(&self) -> bool {
+        const PHY_INTERRUPT_ENABLED: c_uint = 1;
+        // SAFETY: The struct invariant ensures that we may access
+        // this field without additional synchronization.
+        unsafe { (*self.0.get()).interrupts() == PHY_INTERRUPT_ENABLED }
+    }
+
+    /// Gets the PHY interface mode.
+    pub fn interface(&self) -> InterfaceMode {
+        let phydev = self.0.get();
+        // SAFETY: The struct invariant ensures that we may access
+        // this field without additional synchronization.
+        match unsafe { (*phydev).interface } {
+            bindings::phy_interface_t_PHY_INTERFACE_MODE_MII => InterfaceMode::Mii,
+            bindings::phy_interface_t_PHY_INTERFACE_MODE_RMII => InterfaceMode::Rmii,
+            _ => InterfaceMode::Other,
+        }
+    }
+
+    /// Gets the PHY connector port.
+    pub fn port(&self) -> Port {
+        let phydev = self.0.get();
+        // SAFETY: The struct invariant ensures that we may access
+        // this field without additional synchronization.
+        match unsafe { (*phydev).port as u32 } {
+            bindings::PORT_MII => Port::Mii,
+            bindings::PORT_FIBRE => Port::Fibre,
+            _ => Port::Other,
+        }
+    }
+
+    /// Sets the PHY connector port.
+    pub fn set_port(&mut self, port: Port) {
+        let phydev = self.0.get();
+        let v = match port {
+            Port::Mii => bindings::PORT_MII,
+            Port::Fibre => bindings::PORT_FIBRE,
+            Port::Other => return,
+        };
+        // SAFETY: The struct invariant ensures that we may access
+        // this field without additional synchronization.
+        unsafe { (*phydev).port = v as c_int };
+    }
+
+    /// Sets the current link state.
+    pub fn set_link(&mut self, up: bool) {
+        let phydev = self.0.get();
+        // SAFETY: The struct invariant ensures that we may access
+        // this field without additional synchronization.
+        unsafe { (*phydev).set_link(up as c_uint) };
     }
 
     /// Sets the speed of the PHY.
@@ -177,6 +246,22 @@ impl Device {
         // SAFETY: The struct invariant ensures that we may access
         // this field without additional synchronization.
         unsafe { (*phydev).duplex = v as c_int };
+    }
+
+    /// Sets pause state.
+    pub fn set_pause(&mut self, enabled: bool) {
+        let phydev = self.0.get();
+        // SAFETY: The struct invariant ensures that we may access
+        // this field without additional synchronization.
+        unsafe { (*phydev).set_pause(enabled) };
+    }
+
+    /// Sets asymmetric pause state.
+    pub fn set_asym_pause(&mut self, enabled: bool) {
+        let phydev = self.0.get();
+        // SAFETY: The struct invariant ensures that we may access
+        // this field without additional synchronization.
+        unsafe { (*phydev).set_asym_pause(enabled) };
     }
 
     /// Reads a PHY register.
@@ -276,6 +361,58 @@ impl Device {
         // So it's just an FFI call.
         to_result(unsafe { bindings::genphy_read_abilities(phydev) })
     }
+
+    /// Configures auto-negotiation.
+    pub fn genphy_config_aneg(&mut self) -> Result {
+        let phydev = self.0.get();
+        // SAFETY: `phydev` is pointing to a valid object by the type invariant of `Self`.
+        // So it's just an FFI call. This is the open-coded form of the C inline
+        // `genphy_config_aneg(phydev)`.
+        to_result(unsafe { bindings::__genphy_config_aneg(phydev, false) })
+    }
+
+    /// Reads fixed-link status.
+    pub fn genphy_read_status_fixed(&mut self) -> Result {
+        let phydev = self.0.get();
+        // SAFETY: `phydev` is pointing to a valid object by the type invariant of `Self`.
+        // So it's just an FFI call.
+        to_result(unsafe { bindings::genphy_read_status_fixed(phydev) })
+    }
+
+    /// Resolves pause state from auto-negotiation.
+    pub fn resolve_aneg_pause(&mut self) {
+        let phydev = self.0.get();
+        // SAFETY: `phydev` is pointing to a valid object by the type invariant of `Self`.
+        unsafe { bindings::phy_resolve_aneg_pause(phydev) };
+    }
+
+    /// Stores MII LPA register bits in the link partner advertisement bitmap.
+    pub fn set_lp_advertising_from_lpa(&mut self, lpa: u16) {
+        let phydev = self.0.get();
+        // SAFETY: `phydev` is pointing to a valid object by the type invariant of `Self`.
+        unsafe { bindings::mii_lpa_to_phy_lp_advertising(phydev, lpa.into()) };
+    }
+
+    /// Clears the link partner advertisement bitmap.
+    pub fn clear_lp_advertising(&mut self) {
+        let phydev = self.0.get();
+        // SAFETY: `phydev` is pointing to a valid object by the type invariant of `Self`.
+        unsafe { bindings::phy_lp_advertising_zero(phydev) };
+    }
+
+    /// Puts the PHY state machine into the error state.
+    pub fn phy_error(&mut self) {
+        let phydev = self.0.get();
+        // SAFETY: `phydev` is pointing to a valid object by the type invariant of `Self`.
+        unsafe { bindings::phy_error(phydev) };
+    }
+
+    /// Schedules the PHY state machine.
+    pub fn trigger_machine(&mut self) {
+        let phydev = self.0.get();
+        // SAFETY: `phydev` is pointing to a valid object by the type invariant of `Self`.
+        unsafe { bindings::phy_trigger_machine(phydev) };
+    }
 }
 
 impl AsRef<kernel::device::Device> for Device {
@@ -316,6 +453,20 @@ impl<T: Driver> Adapter<T> {
             // `Device` are okay to call.
             let dev = unsafe { Device::from_raw(phydev) };
             T::soft_reset(dev)?;
+            Ok(0)
+        })
+    }
+
+    /// # Safety
+    ///
+    /// `phydev` must be passed by the corresponding callback in `phy_driver`.
+    unsafe extern "C" fn config_init_callback(phydev: *mut bindings::phy_device) -> c_int {
+        from_result(|| {
+            // SAFETY: This callback is called only in contexts
+            // where we hold `phy_device->lock`, so the accessors on
+            // `Device` are okay to call.
+            let dev = unsafe { Device::from_raw(phydev) };
+            T::config_init(dev)?;
             Ok(0)
         })
     }
@@ -403,6 +554,32 @@ impl<T: Driver> Adapter<T> {
             T::read_status(dev)?;
             Ok(0)
         })
+    }
+
+    /// # Safety
+    ///
+    /// `phydev` must be passed by the corresponding callback in `phy_driver`.
+    unsafe extern "C" fn config_intr_callback(phydev: *mut bindings::phy_device) -> c_int {
+        from_result(|| {
+            // SAFETY: This callback is called only in contexts
+            // where we hold `phy_device->lock`, so the accessors on
+            // `Device` are okay to call.
+            let dev = unsafe { Device::from_raw(phydev) };
+            T::config_intr(dev)?;
+            Ok(0)
+        })
+    }
+
+    /// # Safety
+    ///
+    /// `phydev` must be passed by the corresponding callback in `phy_driver`.
+    unsafe extern "C" fn handle_interrupt_callback(
+        phydev: *mut bindings::phy_device,
+    ) -> bindings::irqreturn_t {
+        // SAFETY: This callback is called from PHYLIB interrupt handling with
+        // a valid `phy_device` pointer.
+        let dev = unsafe { Device::from_raw(phydev) };
+        T::handle_interrupt(dev) as bindings::irqreturn_t
     }
 
     /// # Safety
@@ -503,6 +680,11 @@ pub const fn create_phy_driver<T: Driver>() -> DriverVTable {
         } else {
             None
         },
+        config_init: if T::HAS_CONFIG_INIT {
+            Some(Adapter::<T>::config_init_callback)
+        } else {
+            None
+        },
         probe: if T::HAS_PROBE {
             Some(Adapter::<T>::probe_callback)
         } else {
@@ -535,6 +717,16 @@ pub const fn create_phy_driver<T: Driver>() -> DriverVTable {
         },
         read_status: if T::HAS_READ_STATUS {
             Some(Adapter::<T>::read_status_callback)
+        } else {
+            None
+        },
+        config_intr: if T::HAS_CONFIG_INTR {
+            Some(Adapter::<T>::config_intr_callback)
+        } else {
+            None
+        },
+        handle_interrupt: if T::HAS_HANDLE_INTERRUPT {
+            Some(Adapter::<T>::handle_interrupt_callback)
         } else {
             None
         },
@@ -580,6 +772,11 @@ pub trait Driver {
         build_error!(VTABLE_DEFAULT_ERROR)
     }
 
+    /// Initializes the PHY.
+    fn config_init(_dev: &mut Device) -> Result {
+        build_error!(VTABLE_DEFAULT_ERROR)
+    }
+
     /// Sets up device-specific structures during discovery.
     fn probe(_dev: &mut Device) -> Result {
         build_error!(VTABLE_DEFAULT_ERROR)
@@ -604,6 +801,16 @@ pub trait Driver {
 
     /// Determines the negotiated speed and duplex.
     fn read_status(_dev: &mut Device) -> Result<u16> {
+        build_error!(VTABLE_DEFAULT_ERROR)
+    }
+
+    /// Enables or disables PHY interrupts.
+    fn config_intr(_dev: &mut Device) -> Result {
+        build_error!(VTABLE_DEFAULT_ERROR)
+    }
+
+    /// Handles a PHY interrupt.
+    fn handle_interrupt(_dev: &mut Device) -> IrqReturn {
         build_error!(VTABLE_DEFAULT_ERROR)
     }
 
